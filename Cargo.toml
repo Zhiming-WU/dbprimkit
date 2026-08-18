@@ -1,0 +1,11 @@
+[package]
+name = "dbprimkit"
+version = "0.0.0"
+edition = "2024"
+repository = "https://github.com/Zhiming-WU/dbprimkit.git"
+license = "MIT"
+readme = "README.md"
+description = "A kit providing implementations for several database primitives (Work In Progress)"
+documentation = "https://docs.rs/dbprimkit"
+
+[dependencies]
