@@ -1,11 +1,30 @@
 [package]
 name = "dbprimkit"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 repository = "https://github.com/Zhiming-WU/dbprimkit.git"
 license = "MIT"
 readme = "README.md"
-description = "A kit providing implementations for several database primitives (Work In Progress)"
+description = "A kit aims to provide simple implementations for several database primitives (Work In Progress)"
 documentation = "https://docs.rs/dbprimkit"
 
 [dependencies]
+async-stream = {version = "0.3", optional = true }
+bytes = "1.12"
+crc32c = "0.6"
+futures = {version = "0.3", optional = true }
+libc = "0.2"
+rand = "0.10"
+thiserror = "2.0"
+tokio = { version = "1.53", features = ["fs", "io-util", "macros", "rt", "rt-multi-thread", "time"], optional = true }
+
+[features]
+default = ["async"]
+async = ["dep:async-stream", "dep:futures", "dep:tokio"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
