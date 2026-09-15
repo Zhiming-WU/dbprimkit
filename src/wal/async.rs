@@ -295,7 +295,7 @@ struct FlushingControlBlock<IO: AsyncIoBackend + Send + Sync> {
     data_flush_sleep_cnt: u32,
     data_flush_cnt: u32,
     data_flush_disturbed: bool,
-    data_buf: BytesMut,
+    data_buf: Vec<u8>,
     max_flushed_lsn: u64,
     last_filled_lsn: u64,
 }
@@ -328,10 +328,7 @@ impl<IO: AsyncIoBackend + Send + Sync> FlushingControlBlock<IO> {
         self.cb
             .flush_lsn
             .store(self.last_filled_lsn, Ordering::Release);
-        let new_rot = self
-            .data_app
-            .append(&self.data_buf.split().freeze(), rotatable)
-            .await?;
+        let new_rot = self.data_app.append(&self.data_buf, rotatable).await?;
         if new_rot {
             let min_lsn = self.cb.min_lsn.load(Ordering::Acquire);
             Self::flush_mani_entry(self, min_lsn).await?;
@@ -341,7 +338,7 @@ impl<IO: AsyncIoBackend + Send + Sync> FlushingControlBlock<IO> {
             self.data_app.flush().await?;
         }
         // reuse memory
-        self.data_buf.reserve(BUF_SIZE);
+        unsafe { self.data_buf.set_len(0) };
         if rotatable {
             self.cb
                 .max_lsn
@@ -366,8 +363,8 @@ impl<IO: AsyncIoBackend + Send + Sync + 'static> WalWriter<IO> {
         let (mani_rotator, data_rotator, data_rnp, flush_lsn, min_lsn, max_lsn) =
             new_wal_fields(&inst).await?;
         let cb = Arc::new(ControlBlock::new(min_lsn, max_lsn, flush_lsn));
-        let mani_app = RotAppender::new(mani_rotator, true).await?;
-        let data_app = RotAppender::new(data_rotator, true).await?;
+        let mani_app = RotAppender::new(mani_rotator, false).await?;
+        let data_app = RotAppender::new(data_rotator, false).await?;
         let out = Self {
             inst,
             cb: cb.clone(),
@@ -413,7 +410,7 @@ impl<IO: AsyncIoBackend + Send + Sync + 'static> WalWriter<IO> {
                 data_flush_sleep_cnt: 0,
                 data_flush_cnt: 0,
                 data_flush_disturbed: false,
-                data_buf: BytesMut::with_capacity(BUF_SIZE),
+                data_buf: Vec::with_capacity(BUF_SIZE),
                 max_flushed_lsn: cb.max_lsn.load(Ordering::Acquire),
                 last_filled_lsn: 0,
                 cb,
@@ -450,7 +447,7 @@ impl<IO: AsyncIoBackend + Send + Sync + 'static> WalWriter<IO> {
                 while !handled {
                     if (fcb.data_buf.len() & BLOCK_MASK) == 0 {
                         fcb.fix_block_headers();
-                        DiskBlockHeader::encode_by_params(&mut fcb.data_buf, lsn);
+                        DiskBlockHeader::encode(&mut fcb.data_buf, lsn);
                     }
                     let left = log.len();
                     let bk_left = BLOCK_SIZE - (fcb.data_buf.len() & BLOCK_MASK);
@@ -462,12 +459,7 @@ impl<IO: AsyncIoBackend + Send + Sync + 'static> WalWriter<IO> {
                         } else {
                             Fullness::Full
                         };
-                        DiskLogEntry::encode_by_params(
-                            &mut fcb.data_buf,
-                            lsn,
-                            log.split_to(left),
-                            fullness,
-                        );
+                        DiskLogEntry::encode(&mut fcb.data_buf, lsn, log.split_to(left), fullness);
                         fcb.last_filled_lsn = lsn;
                         fcb.max_flushed_lsn = lsn;
                         handled = true;
@@ -482,7 +474,7 @@ impl<IO: AsyncIoBackend + Send + Sync + 'static> WalWriter<IO> {
                             Fullness::First
                         };
                         let part_log = log.split_to(bk_left - LOG_HEAD_SIZE);
-                        DiskLogEntry::encode_by_params(&mut fcb.data_buf, lsn, part_log, fullness);
+                        DiskLogEntry::encode(&mut fcb.data_buf, lsn, part_log, fullness);
                         fcb.last_filled_lsn = lsn;
                     } else if bk_left > 0 {
                         // fill zero
@@ -540,6 +532,7 @@ impl<IO: AsyncIoBackend + Send + Sync + 'static> WalWriter<IO> {
     ) {
         if let Err(err) = Self::flushing_task_inner(cb.clone(), mani_app, data_app, data_rnp).await
         {
+            eprintln!("Error occurred in flushing thread: err={:?}", err);
             cb.running.store(false, Ordering::Release);
         }
     }

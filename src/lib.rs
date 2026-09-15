@@ -6,6 +6,9 @@
 //! - [appender]
 //! - [wal]
 
+use std::alloc::{Layout, alloc, dealloc};
+use std::ptr::NonNull;
+
 pub mod appender;
 pub mod arena;
 pub mod bloomfilter;
@@ -53,3 +56,27 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug)]
 #[repr(align(64))]
 struct CacheAligned<T>(T);
+
+pub(crate) struct AlignedBuffer {
+    ptr: NonNull<u8>,
+    layout: Layout,
+}
+
+impl AlignedBuffer {
+    pub(crate) fn new(size: usize, align: usize) -> Self {
+        let layout = Layout::from_size_align(size, align).unwrap();
+        let raw_ptr = unsafe { alloc(layout) };
+        let ptr = NonNull::new(raw_ptr).unwrap();
+        Self { ptr, layout }
+    }
+
+    pub(crate) fn get_vec(&self) -> Vec<u8> {
+        unsafe { Vec::from_raw_parts(self.ptr.as_ptr(), 0, self.layout.size()) }
+    }
+}
+
+impl Drop for AlignedBuffer {
+    fn drop(&mut self) {
+        unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
+    }
+}

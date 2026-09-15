@@ -41,7 +41,7 @@ use super::*;
 use crate::Error::{CorruptFile, InvalidArgument, MiscError};
 use crate::appender::sync::*;
 use crate::io::{IoBackend, StdFileIoBackend};
-use crate::{Error, Result};
+use crate::{AlignedBuffer, Error, Result};
 use bytes::{Bytes, BytesMut};
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
@@ -49,6 +49,7 @@ use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
 use std::time::Duration;
 
 struct WalDataRotNameProviderImpl<IO: IoBackend> {
@@ -276,7 +277,8 @@ struct FlushingControlBlock<IO: IoBackend> {
     data_flush_sleep_cnt: u32,
     data_flush_cnt: u32,
     data_flush_disturbed: bool,
-    data_buf: BytesMut,
+    _aligned_buf: AlignedBuffer,
+    data_buf: Vec<u8>,
     max_flushed_lsn: u64,
     last_filled_lsn: u64,
 }
@@ -308,9 +310,7 @@ impl<IO: IoBackend> FlushingControlBlock<IO> {
         self.cb
             .flush_lsn
             .store(self.last_filled_lsn, Ordering::Release);
-        let new_rot = self
-            .data_app
-            .append(&self.data_buf.split().freeze(), rotatable)?;
+        let new_rot = self.data_app.append(&self.data_buf, rotatable)?;
         if new_rot {
             let min_lsn = self.cb.min_lsn.load(Ordering::Acquire);
             Self::flush_mani_entry(self, min_lsn)?;
@@ -320,7 +320,7 @@ impl<IO: IoBackend> FlushingControlBlock<IO> {
             self.data_app.flush()?;
         }
         // reuse memory
-        self.data_buf.reserve(BUF_SIZE);
+        unsafe { self.data_buf.set_len(0) };
         if rotatable {
             self.cb
                 .max_lsn
@@ -344,7 +344,7 @@ impl<IO: IoBackend + Send> WalWriter<IO> {
         let (mani_rotator, data_rotator, data_rnp, flush_lsn, min_lsn, max_lsn) =
             new_wal_fields(&inst)?;
         let cb = Arc::new(ControlBlock::new(min_lsn, max_lsn, flush_lsn));
-        let mani_app = RotAppender::new(mani_rotator, true)?;
+        let mani_app = RotAppender::new(mani_rotator, false)?;
         let data_app = RotAppender::new(data_rotator, true)?;
         let out = Self {
             inst,
@@ -372,6 +372,8 @@ impl<IO: IoBackend + Send> WalWriter<IO> {
         let mut fcb = {
             let min_lsn = cb.min_lsn.load(Ordering::Acquire);
             let next_no_use_lsn = remove_no_use_rots(data_app.get_rotator(), &data_rnp, min_lsn)?;
+            let aligned_buf = crate::AlignedBuffer::new(BUF_SIZE, 4096);
+            let data_buf = aligned_buf.get_vec();
             let mut fcb = FlushingControlBlock::<IO> {
                 mani_app,
                 data_app,
@@ -383,7 +385,8 @@ impl<IO: IoBackend + Send> WalWriter<IO> {
                 data_flush_sleep_cnt: 0,
                 data_flush_cnt: 0,
                 data_flush_disturbed: false,
-                data_buf: BytesMut::with_capacity(BUF_SIZE),
+                _aligned_buf: aligned_buf,
+                data_buf: data_buf,
                 max_flushed_lsn: cb.max_lsn.load(Ordering::Acquire),
                 last_filled_lsn: 0,
                 cb,
@@ -394,16 +397,20 @@ impl<IO: IoBackend + Send> WalWriter<IO> {
             fcb
         };
 
+        let mut backoff_count = 0u32;
         while fcb.cb.running.load(Ordering::Acquire) {
+            let mut noop = true;
             let min_lsn = fcb.cb.min_lsn.load(Ordering::Acquire);
             if min_lsn > fcb.last_min_lsn {
                 if min_lsn >= fcb.next_no_use_lsn {
+                    noop = false;
                     fcb.next_no_use_lsn =
                         remove_no_use_rots(fcb.data_app.get_rotator(), &fcb.data_rnp, min_lsn)?;
                 }
                 if min_lsn - fcb.last_min_lsn >= MANI_FLUSH_LSN_GAP_THRES
                     || fcb.mani_flush_sleep_cnt >= MANI_FLUSH_SLEEP_THRES
                 {
+                    noop = false;
                     fcb.flush_mani_entry(min_lsn)?;
                     fcb.last_min_lsn = min_lsn;
                 }
@@ -414,12 +421,13 @@ impl<IO: IoBackend + Send> WalWriter<IO> {
                 payload: mut log,
             }) = fcb.cb.rbuf.pop_for_sc()
             {
+                noop = false;
                 let mut split = false;
                 let mut handled = false;
                 while !handled {
                     if (fcb.data_buf.len() & BLOCK_MASK) == 0 {
                         fcb.fix_block_headers();
-                        DiskBlockHeader::encode_by_params(&mut fcb.data_buf, lsn);
+                        DiskBlockHeader::encode(&mut fcb.data_buf, lsn);
                     }
                     let left = log.len();
                     let bk_left = BLOCK_SIZE - (fcb.data_buf.len() & BLOCK_MASK);
@@ -431,12 +439,7 @@ impl<IO: IoBackend + Send> WalWriter<IO> {
                         } else {
                             Fullness::Full
                         };
-                        DiskLogEntry::encode_by_params(
-                            &mut fcb.data_buf,
-                            lsn,
-                            log.split_to(left),
-                            fullness,
-                        );
+                        DiskLogEntry::encode(&mut fcb.data_buf, lsn, log.split_to(left), fullness);
                         fcb.last_filled_lsn = lsn;
                         fcb.max_flushed_lsn = lsn;
                         handled = true;
@@ -449,7 +452,7 @@ impl<IO: IoBackend + Send> WalWriter<IO> {
                             Fullness::First
                         };
                         let part_log = log.split_to(bk_left - LOG_HEAD_SIZE);
-                        DiskLogEntry::encode_by_params(&mut fcb.data_buf, lsn, part_log, fullness);
+                        DiskLogEntry::encode(&mut fcb.data_buf, lsn, part_log, fullness);
                         fcb.last_filled_lsn = lsn;
                     } else if bk_left > 0 {
                         // fill zero
@@ -488,13 +491,31 @@ impl<IO: IoBackend + Send> WalWriter<IO> {
             // no sleep if disturbed
             if fcb.data_flush_disturbed {
                 fcb.data_flush_disturbed = false;
+                backoff_count = 0;
                 continue;
             }
 
-            std::thread::sleep(interval);
-            fcb.mani_flush_sleep_cnt += 1;
-            fcb.data_flush_sleep_cnt += 1;
+            if noop {
+                if backoff_count <= 200 {
+                    backoff_count += 1;
+                }
+                if backoff_count <= 100 {
+                    std::hint::spin_loop();
+                } else {
+                    if backoff_count <= 200 {
+                        thread::yield_now();
+                    } else {
+                        std::thread::sleep(interval);
+                        fcb.mani_flush_sleep_cnt += 1;
+                        fcb.data_flush_sleep_cnt += 1;
+                    }
+                }
+            } else {
+                backoff_count = 0;
+            }
         }
+        // Call it to avoid deallocating underlying memory by Vec, which should be done by AlignedBuffer.
+        let _ = fcb.data_buf.into_raw_parts();
         Ok(())
     }
 
@@ -504,7 +525,8 @@ impl<IO: IoBackend + Send> WalWriter<IO> {
         data_app: RotAppender<IO, DefaultRotator<IO, WalDataRotNameProvider<IO>>>,
         data_rnp: Arc<WalDataRotNameProviderImpl<IO>>,
     ) {
-        if let Err(_err) = Self::flushing_task_inner(cb.clone(), mani_app, data_app, data_rnp) {
+        if let Err(err) = Self::flushing_task_inner(cb.clone(), mani_app, data_app, data_rnp) {
+            eprintln!("Error occurred in flushing thread: err={:?}", err);
             cb.running.store(false, Ordering::Release);
         }
     }

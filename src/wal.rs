@@ -191,7 +191,7 @@ impl DiskLogEntry {
         }
     }
 
-    fn encode(&self, buf: &mut BytesMut) {
+    fn encode_self(&self, buf: &mut BytesMut) {
         let ostart = buf.len();
         buf.put_bytes(0, 4);
         buf.put_u32_ne(self.len);
@@ -205,7 +205,7 @@ impl DiskLogEntry {
         buf[ostart..(ostart + 4)].copy_from_slice(&crc.to_ne_bytes());
     }
 
-    fn encode_by_params(buf: &mut BytesMut, lsn: u64, payload: Bytes, fullness: Fullness) {
+    fn encode(buf: &mut Vec<u8>, lsn: u64, payload: Bytes, fullness: Fullness) {
         let ostart = buf.len();
         buf.put_bytes(0, 4);
         buf.put_u32_ne(payload.len() as u32);
@@ -288,7 +288,7 @@ impl Default for DiskBlockHeader {
 const BLOCK_HEAD_SIZE: usize = std::mem::size_of::<DiskBlockHeader>();
 
 impl DiskBlockHeader {
-    fn encode(&self, buf: &mut BytesMut) {
+    fn encode_self(&self, buf: &mut BytesMut) {
         buf.put_bytes(0, 4);
         buf.put_u8(self.ver);
         buf.put(&self.resv[..]);
@@ -298,7 +298,7 @@ impl DiskBlockHeader {
         buf[0..4].copy_from_slice(&crc.to_ne_bytes());
     }
 
-    fn encode_by_params(buf: &mut BytesMut, min_lsn: u64) {
+    fn encode(buf: &mut Vec<u8>, min_lsn: u64) {
         buf.put_u64_ne(0);
         buf.put_u64_ne(min_lsn);
         buf.put_u64_ne(0);
@@ -469,7 +469,7 @@ mod tests {
         entry.min_lsn = 0x1234567890abcdef;
         entry.max_lsn = 0xfedcba9876543210;
         let mut buf = BytesMut::with_capacity(BLOCK_HEAD_SIZE);
-        entry.encode(&mut buf);
+        entry.encode_self(&mut buf);
         let mut buf = buf.freeze();
         assert_eq!(buf.len(), BLOCK_HEAD_SIZE);
         let decoded = DiskBlockHeader::decode(&mut buf).unwrap();
@@ -493,8 +493,8 @@ mod tests {
         let e1 = DiskLogEntry::new(0x1234567890abcdef, p1, Fullness::Full);
         let e2 = DiskLogEntry::new(0xfedcba9876543210, p2, Fullness::Middle);
         let mut buf = BytesMut::with_capacity(len);
-        e1.encode(&mut buf);
-        e2.encode(&mut buf);
+        e1.encode_self(&mut buf);
+        e2.encode_self(&mut buf);
         let mut buf = buf.freeze();
         let decoded1 = DiskLogEntry::decode(&mut buf).unwrap();
         let decoded2 = DiskLogEntry::decode(&mut buf).unwrap();

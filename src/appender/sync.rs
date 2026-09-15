@@ -238,7 +238,6 @@ impl<IO: IoBackend, RNP: RotNameProvider<IO>> Rotator<IO> for DefaultRotator<IO,
     fn new_rot(&mut self, direct_io: bool) -> Result<IO::Writer> {
         let rot_names = self.list_rot_names()?;
         if self.max_rot != 0 && rot_names.len() >= self.max_rot as usize {
-            println!("Removing oldest rot, name={}", &rot_names[0]);
             self.remove_rot(&rot_names[0])?;
         }
         let next_no = self.cur_rot_no + 1;
@@ -384,7 +383,6 @@ mod tests {
         assert_eq!(res.1, exp_names[1]);
         StdFileIoBackend::remove_file(&paths[0]).unwrap();
         StdFileIoBackend::remove_file(&paths[1]).unwrap();
-        println!("{}, {}", &paths[0], &paths[1]);
     }
 
     #[test]
