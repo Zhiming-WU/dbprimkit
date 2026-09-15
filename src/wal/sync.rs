@@ -10,7 +10,7 @@
 //!     let writer = inst.open_wal_writer().unwrap();
 //!     // Append log entries
 //!     let lsn1 = writer.append(bytes::Bytes::from("my first log")).unwrap();
-//!     let lsn2 = writer.append(bytes::Bytes::from("my first log")).unwrap();
+//!     let lsn2 = writer.append(bytes::Bytes::from("my second log")).unwrap();
 //!     // Check the maxinum LSN of log entries which have been persisted
 //!     let max_lsn = writer.get_max_lsn();
 //!     // Notify the WAL that logs below or equal to `max_lsn` are no long needed.
@@ -372,7 +372,7 @@ impl<IO: IoBackend + Send> WalWriter<IO> {
         let mut fcb = {
             let min_lsn = cb.min_lsn.load(Ordering::Acquire);
             let next_no_use_lsn = remove_no_use_rots(data_app.get_rotator(), &data_rnp, min_lsn)?;
-            let aligned_buf = crate::AlignedBuffer::new(BUF_SIZE, 4096);
+            let aligned_buf = AlignedBuffer::new(BUF_SIZE, 4096);
             let data_buf = aligned_buf.get_vec();
             let mut fcb = FlushingControlBlock::<IO> {
                 mani_app,
@@ -404,6 +404,7 @@ impl<IO: IoBackend + Send> WalWriter<IO> {
             if min_lsn > fcb.last_min_lsn {
                 if min_lsn >= fcb.next_no_use_lsn {
                     noop = false;
+                    fcb.flush_mani_entry(min_lsn)?;
                     fcb.next_no_use_lsn =
                         remove_no_use_rots(fcb.data_app.get_rotator(), &fcb.data_rnp, min_lsn)?;
                 }
@@ -412,7 +413,6 @@ impl<IO: IoBackend + Send> WalWriter<IO> {
                 {
                     noop = false;
                     fcb.flush_mani_entry(min_lsn)?;
-                    fcb.last_min_lsn = min_lsn;
                 }
             }
 

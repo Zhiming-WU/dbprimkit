@@ -11,7 +11,7 @@
 //!     let writer = inst.open_wal_writer().await.unwrap();
 //!     // Append log entries
 //!     let lsn1 = writer.append(bytes::Bytes::from("my first log")).unwrap();
-//!     let lsn2 = writer.append(bytes::Bytes::from("my first log")).unwrap();
+//!     let lsn2 = writer.append(bytes::Bytes::from("my second log")).unwrap();
 //!     // Check the maxinum LSN of log entries which have been persisted
 //!     let max_lsn = writer.get_max_lsn();
 //!     // Notify the WAL that logs below or equal to `max_lsn` are no long needed.
@@ -425,6 +425,7 @@ impl<IO: AsyncIoBackend + Send + Sync + 'static> WalWriter<IO> {
             let min_lsn = fcb.cb.min_lsn.load(Ordering::Acquire);
             if min_lsn > fcb.last_min_lsn {
                 if min_lsn >= fcb.next_no_use_lsn {
+                    fcb.flush_mani_entry(min_lsn).await?;
                     fcb.next_no_use_lsn =
                         remove_no_use_rots(fcb.data_app.get_rotator(), &fcb.data_rnp, min_lsn)
                             .await?;
@@ -433,7 +434,6 @@ impl<IO: AsyncIoBackend + Send + Sync + 'static> WalWriter<IO> {
                     || fcb.mani_flush_sleep_cnt >= MANI_FLUSH_SLEEP_THRES
                 {
                     fcb.flush_mani_entry(min_lsn).await?;
-                    fcb.last_min_lsn = min_lsn;
                 }
             }
 

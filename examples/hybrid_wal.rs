@@ -1,19 +1,23 @@
-//! An example using StdFileWalInstance for both writer and reader in non-async code.
+//! An example using StdFileWalInstance for writer and using TokioFileWalInstance for in async code.
+//! Usually [crate::wal::sync::WalInstance] has a better
 
 use bytes::{BufMut, Bytes, BytesMut};
 use dbprimkit::Error::RingBufferFull;
-use dbprimkit::io::{IoBackend, StdFileIoBackend};
+use dbprimkit::io::{AsyncIoBackend, TokioFileIoBackend};
 use dbprimkit::wal::LogEntry;
+use dbprimkit::wal::r#async::TokioFileWalInstance;
 use dbprimkit::wal::sync::StdFileWalInstance;
+use futures::StreamExt;
 use rand::RngExt;
 use std::collections::BTreeMap;
 use std::env;
 use std::path::Path;
 use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let args: Vec<String> = env::args().collect();
     let dir = AsRef::<Path>::as_ref(args[1].as_str()).to_path_buf();
     let name = args[2].as_str();
@@ -35,7 +39,6 @@ fn main() {
         };
         let mut bm = BytesMut::with_capacity(len);
         let byte = rng.random::<u8>();
-        //println!("debug: len={}, byte={:02x}", len, byte);
         bm.put_bytes(byte, len);
         bufs.push(bm.freeze());
     }
@@ -48,7 +51,7 @@ fn main() {
     for idx in 0..bufs.len() {
         let buf = bufs[idx].clone();
         let wal = writer.clone();
-        handles.push(thread::spawn(move || {
+        handles.push(tokio::spawn(async move {
             let mut logs = Vec::new();
             let mut lsn;
             let mut adv_lsn = 0u64;
@@ -56,7 +59,7 @@ fn main() {
                 let res = wal.append(buf.clone());
                 lsn = match res {
                     Err(RingBufferFull) => {
-                        thread::sleep(Duration::from_micros(1));
+                        tokio::time::sleep(Duration::from_micros(1)).await;
                         continue;
                     }
                     Err(_) => res.unwrap(),
@@ -67,8 +70,8 @@ fn main() {
                     lsn,
                     payload: buf.clone(),
                 });
-                if buf.len() > 256 * 1024 {
-                    thread::sleep(Duration::from_micros(1));
+                if buf.len() >= 256 * 1024 {
+                    tokio::time::sleep(Duration::from_micros(1)).await;
                 }
                 if idx == 0 && adv {
                     if lsn % 1000 == 0 {
@@ -93,7 +96,7 @@ fn main() {
     let mut max_adv_lsn = 0u64;
     let mut total_wbytes = 0u64;
     for handle in handles {
-        let res = handle.join().unwrap();
+        let res = handle.await.unwrap();
         if res.1 > 0 {
             max_adv_lsn = res.1;
         }
@@ -121,7 +124,7 @@ fn main() {
                 printed = true;
             }
         }
-        thread::sleep(Duration::from_micros(1));
+        tokio::time::sleep(Duration::from_micros(1)).await;
         flashed_lsn = writer.get_max_lsn();
     }
     println!(
@@ -130,15 +133,17 @@ fn main() {
         total_wbytes,
         wstart_time.elapsed()
     );
-    let inst = Arc::try_unwrap(writer).unwrap().stop();
+    Arc::try_unwrap(writer).unwrap().stop();
+
     let rstart_time = Instant::now();
-    let reader = inst.open_wal_reader().unwrap();
+    let inst = TokioFileWalInstance::new(name, dir.as_path());
+    let reader = inst.open_wal_reader().await.unwrap();
     let min_rlsn = reader.get_min_lsn();
     assert!(min_rlsn <= max_adv_lsn + 1);
-    let iter = reader.get_log_iter(min_rlsn).unwrap();
+    let mut stream = reader.get_log_stream(min_rlsn).await.unwrap();
     let mut max_rlsn = 0u64;
     let mut total_rbytes = 0u64;
-    for log in iter {
+    while let Some(log) = stream.next().await {
         let rlog = log.unwrap();
         if rlog.lsn <= max_rlsn {
             panic!(
@@ -167,9 +172,11 @@ fn main() {
         total_rbytes,
         rstart_time.elapsed()
     );
-    let names = StdFileIoBackend::list_files(&dir, Some(|n: &str| n.starts_with(name))).unwrap();
+    let names = TokioFileIoBackend::list_files(&dir, Some(|n: &str| n.starts_with(name)))
+        .await
+        .unwrap();
     for n in names {
         let p = &dir.join(&n);
-        StdFileIoBackend::remove_file(p).unwrap();
+        TokioFileIoBackend::remove_file(p).await.unwrap();
     }
 }

@@ -1,3 +1,4 @@
+//! An example using TokioFileWalInstance for both writer and reader in async code.
 use bytes::{BufMut, Bytes, BytesMut};
 use dbprimkit::Error::RingBufferFull;
 use dbprimkit::io::{AsyncIoBackend, TokioFileIoBackend};

@@ -1,5 +1,11 @@
-//! A simple WAL (Write Ahead Log) implementation.
+//! A simple WAL (Write Ahead Log) implementation. See [sync] and [async] for more information.
 //!
+//! For use as writer, usually [sync::WalInstance] has a better performance
+//! than [async::WalInstance] since a dedicated flushing thread is used to
+//! avoid the transfering overheads between the flushing task and tokio blocking IO threads.
+//!
+//! After opened, the [sync::WalWriter] can be used in async code since it has no
+//! time-consuming blocking method.
 
 use crate::{CacheAligned, Error, Result};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
