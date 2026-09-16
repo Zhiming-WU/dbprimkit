@@ -182,14 +182,22 @@ async fn restore_lsn<IO: AsyncIoBackend + Send + Sync>(
     match mani_rotator.restore_latest_rot(false).await? {
         None => Ok((0, 0)),
         Some((mut reader, file_size)) => {
-            let mani_entry = read_latest_manifest_entry::<IO>(&mut reader, file_size).await?;
+            let mut min_lsn = if file_size == 0 {
+                0
+            } else {
+                let mani_entry = read_latest_manifest_entry::<IO>(&mut reader, file_size).await?;
+                mani_entry.min_lsn
+            };
             let max_lsn = match data_rotator.restore_latest_rot(false).await? {
                 None => return Err(MiscError("Missing data rotations".into())),
                 Some((mut data_reader, data_file_size)) => {
-                    restore_max_lsn::<IO>(&mut data_reader, data_file_size).await?
+                    if file_size == 0 && min_lsn == 0 {
+                        0
+                    } else {
+                        restore_max_lsn::<IO>(&mut data_reader, data_file_size).await?
+                    }
                 }
             };
-            let mut min_lsn = mani_entry.min_lsn;
             if min_lsn == 0 && max_lsn > 0 {
                 min_lsn = 1;
             }
@@ -918,7 +926,7 @@ mod tests {
     use std::collections::BTreeMap;
     use tokio::time::Instant;
 
-    async fn test_wal(dir: &str, name: &str, lsn_limit: u64, adv: bool) {
+    async fn test_wal(dir: &str, name: &str, lsn_limit: u64, adv: bool, do_clean: bool) {
         let dir = AsRef::<Path>::as_ref(dir).to_path_buf();
         let mut rng = rand::rng();
         let mut bufs = Vec::<Bytes>::new();
@@ -991,6 +999,7 @@ mod tests {
         let mut max_wlsn = 0u64;
         let mut log_map = BTreeMap::<u64, Bytes>::new();
         let mut max_adv_lsn = 0u64;
+        let mut total_wbytes = 0u64;
         for handle in handles {
             let res = handle.await.unwrap();
             if res.1 > 0 {
@@ -1003,6 +1012,7 @@ mod tests {
                 if max_wlsn < log.lsn {
                     max_wlsn = log.lsn;
                 }
+                total_wbytes += log.payload.len() as u64;
                 log_map.insert(log.lsn, log.payload);
             }
         }
@@ -1022,12 +1032,16 @@ mod tests {
             tokio::time::sleep(Duration::from_micros(1)).await;
             flashed_lsn = writer.get_max_lsn();
         }
-        println!("wduration: {:?}", wstart_time.elapsed());
+        println!(
+            "info: max_wlsn={}, total_wbytes={}, wduration={:?}",
+            max_wlsn,
+            total_wbytes,
+            wstart_time.elapsed()
+        );
         let inst = Arc::try_unwrap(writer).unwrap().stop();
         let rstart_time = Instant::now();
         let reader = inst.open_wal_reader().await.unwrap();
         let min_rlsn = reader.get_min_lsn();
-        println!("debug: min_rlsn={}", min_rlsn);
         assert!(min_rlsn <= max_adv_lsn + 1);
         let mut stream = reader.get_log_stream(min_rlsn).await.unwrap();
         let mut max_rlsn = 0u64;
@@ -1061,56 +1075,142 @@ mod tests {
             total_rbytes,
             rstart_time.elapsed()
         );
-        let names = TokioFileIoBackend::list_files(&dir, Some(|n: &str| n.starts_with(name)))
-            .await
-            .unwrap();
-        for n in names {
-            let p = &dir.join(&n);
-            TokioFileIoBackend::remove_file(p).await.unwrap();
+        if do_clean {
+            let names = TokioFileIoBackend::list_files(&dir, Some(|n: &str| n.starts_with(name)))
+                .await
+                .unwrap();
+            for n in names {
+                let p = &dir.join(&n);
+                TokioFileIoBackend::remove_file(p).await.unwrap();
+            }
         }
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_wal_mem_small_adv() {
-        test_wal("/dev/shm", "test_wal_mem_small_adv_async", 10000, true).await;
+        test_wal(
+            "/dev/shm",
+            "test_wal_mem_small_adv_async",
+            10000,
+            true,
+            true,
+        )
+        .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_wal_mem_small_noadv() {
-        test_wal("/dev/shm", "test_wal_mem_small_noadv_async", 10000, false).await;
+        test_wal(
+            "/dev/shm",
+            "test_wal_mem_small_noadv_async",
+            10000,
+            false,
+            true,
+        )
+        .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_wal_disk_small_adv() {
-        test_wal("/tmp", "test_wal_disk_small_adv_async", 10000, true).await;
+        test_wal("/tmp", "test_wal_disk_small_adv_async", 10000, true, true).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_wal_disk_small_noadv() {
-        test_wal("/tmp", "test_wal_disk_small_noadv_async", 10000, false).await;
+        test_wal(
+            "/tmp",
+            "test_wal_disk_small_noadv_async",
+            10000,
+            false,
+            true,
+        )
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore]
     async fn test_wal_mem_large_adv() {
-        test_wal("/dev/shm", "test_wal_mem_large_adv_async", 1000000, true).await;
+        test_wal(
+            "/dev/shm",
+            "test_wal_mem_large_adv_async",
+            1000000,
+            true,
+            true,
+        )
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore]
     async fn test_wal_mem_large_noadv() {
-        test_wal("/dev/shm", "test_wal_mem_large_noadv_async", 1000000, false).await;
+        test_wal(
+            "/dev/shm",
+            "test_wal_mem_large_noadv_async",
+            1000000,
+            false,
+            true,
+        )
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore]
     async fn test_wal_disk_large_adv() {
-        test_wal("/tmp", "test_wal_disk_large_adv_async", 1000000, true).await;
+        test_wal("/tmp", "test_wal_disk_large_adv_async", 1000000, true, true).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore]
     async fn test_wal_disk_large_noadv() {
-        test_wal("/tmp", "test_wal_disk_large_noadv_async", 1000000, false).await;
+        test_wal(
+            "/tmp",
+            "test_wal_disk_large_noadv_async",
+            1000000,
+            false,
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn test_wal_mem_large_adv_twice() {
+        test_wal(
+            "/dev/shm",
+            "twice_test_wal_mem_large_adv_async",
+            1000000,
+            true,
+            false,
+        )
+        .await;
+        test_wal(
+            "/dev/shm",
+            "twice_test_wal_mem_large_adv_async",
+            2000000,
+            true,
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn test_wal_disk_large_adv_twice() {
+        test_wal(
+            "/tmp",
+            "twice_test_wal_disk_large_adv_async",
+            1000000,
+            true,
+            false,
+        )
+        .await;
+        test_wal(
+            "/tmp",
+            "twice_test_wal_disk_large_adv_async",
+            2000000,
+            true,
+            true,
+        )
+        .await;
     }
 }

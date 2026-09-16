@@ -1,6 +1,7 @@
 //! Common IO basics, mainly persistence backend abstraction used in other parts of this crate.
 use crate::{Error, Result};
 use std::io::{Read, Seek, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 #[cfg(feature = "async")]
@@ -57,7 +58,7 @@ impl Syncable for std::fs::File {
 /// Persistent IO backend.
 pub trait IoBackend: Send + Sync + 'static {
     type Reader: Read + Seek + Sync + Send;
-    type Writer: Write + Seek + Syncable + Sync + Send;
+    type Writer: Write + Seek + Syncable + AsRawFd + Sync + Send;
     type ReadWriter: Read + Write + Seek + Syncable + Sync + Send;
 
     /// Make sure a path is a directory.

@@ -171,14 +171,22 @@ fn restore_lsn<IO: IoBackend>(
     match mani_rotator.restore_latest_rot(false)? {
         None => Ok((0, 0)),
         Some((mut reader, file_size)) => {
-            let mani_entry = read_latest_manifest_entry::<IO>(&mut reader, file_size)?;
+            let mut min_lsn = if file_size == 0 {
+                0
+            } else {
+                let mani_entry = read_latest_manifest_entry::<IO>(&mut reader, file_size)?;
+                mani_entry.min_lsn
+            };
             let max_lsn = match data_rotator.restore_latest_rot(false)? {
                 None => return Err(MiscError("Missing data rotations".into())),
                 Some((mut data_reader, data_file_size)) => {
-                    restore_max_lsn::<IO>(&mut data_reader, data_file_size)?
+                    if file_size == 0 && min_lsn == 0 {
+                        0
+                    } else {
+                        restore_max_lsn::<IO>(&mut data_reader, data_file_size)?
+                    }
                 }
             };
-            let mut min_lsn = mani_entry.min_lsn;
             if min_lsn == 0 && max_lsn > 0 {
                 min_lsn = 1;
             }
@@ -310,13 +318,19 @@ impl<IO: IoBackend> FlushingControlBlock<IO> {
         self.cb
             .flush_lsn
             .store(self.last_filled_lsn, Ordering::Release);
-        let new_rot = self.data_app.append(&self.data_buf, rotatable)?;
+        let uring_is_used = self.data_app.uring_is_used();
+        let new_rot = if uring_is_used {
+            self.data_app
+                .uring_append_flush(&self.data_buf, rotatable)?
+        } else {
+            self.data_app.append(&self.data_buf, rotatable)?
+        };
         if new_rot {
             let min_lsn = self.cb.min_lsn.load(Ordering::Acquire);
             Self::flush_mani_entry(self, min_lsn)?;
             self.next_no_use_lsn =
                 remove_no_use_rots(self.data_app.get_rotator(), &self.data_rnp, min_lsn)?;
-        } else {
+        } else if !uring_is_used {
             self.data_app.flush()?;
         }
         // reuse memory
@@ -328,6 +342,17 @@ impl<IO: IoBackend> FlushingControlBlock<IO> {
         }
         self.data_flush_sleep_cnt = 0;
         Ok(())
+    }
+}
+
+impl<IO: IoBackend> Drop for FlushingControlBlock<IO> {
+    fn drop(&mut self) {
+        // Call it to avoid deallocating underlying memory by Vec, which should be done by AlignedBuffer.
+        let buf = std::mem::take(&mut self.data_buf);
+        let _ = buf.into_raw_parts();
+        if self.data_app.uring_is_used() {
+            self.data_app.uring_unregister_buf();
+        }
     }
 }
 
@@ -344,8 +369,8 @@ impl<IO: IoBackend + Send> WalWriter<IO> {
         let (mani_rotator, data_rotator, data_rnp, flush_lsn, min_lsn, max_lsn) =
             new_wal_fields(&inst)?;
         let cb = Arc::new(ControlBlock::new(min_lsn, max_lsn, flush_lsn));
-        let mani_app = RotAppender::new(mani_rotator, false)?;
-        let data_app = RotAppender::new(data_rotator, true)?;
+        let mani_app = RotAppender::new(mani_rotator, false, false)?;
+        let data_app = RotAppender::new(data_rotator, true, true)?;
         let out = Self {
             inst,
             cb: cb.clone(),
@@ -360,7 +385,7 @@ impl<IO: IoBackend + Send> WalWriter<IO> {
     fn flushing_task_inner(
         cb: Arc<ControlBlock>,
         mani_app: RotAppender<IO, DefaultRotator<IO>>,
-        data_app: RotAppender<IO, DefaultRotator<IO, WalDataRotNameProvider<IO>>>,
+        mut data_app: RotAppender<IO, DefaultRotator<IO, WalDataRotNameProvider<IO>>>,
         data_rnp: Arc<WalDataRotNameProviderImpl<IO>>,
     ) -> Result<()> {
         let interval = Duration::from_millis(1);
@@ -373,7 +398,11 @@ impl<IO: IoBackend + Send> WalWriter<IO> {
             let min_lsn = cb.min_lsn.load(Ordering::Acquire);
             let next_no_use_lsn = remove_no_use_rots(data_app.get_rotator(), &data_rnp, min_lsn)?;
             let aligned_buf = AlignedBuffer::new(BUF_SIZE, 4096);
-            let data_buf = aligned_buf.get_vec();
+            let mut data_buf = aligned_buf.get_vec();
+            if data_app.uring_is_used() {
+                let capa = data_buf.capacity();
+                data_app.uring_register_buf(&mut data_buf, capa)?;
+            }
             let mut fcb = FlushingControlBlock::<IO> {
                 mani_app,
                 data_app,
@@ -514,8 +543,6 @@ impl<IO: IoBackend + Send> WalWriter<IO> {
                 backoff_count = 0;
             }
         }
-        // Call it to avoid deallocating underlying memory by Vec, which should be done by AlignedBuffer.
-        let _ = fcb.data_buf.into_raw_parts();
         Ok(())
     }
 
@@ -913,7 +940,7 @@ mod tests {
     use std::thread;
     use std::time::Instant;
 
-    fn test_wal(dir: &str, name: &str, lsn_limit: u64, adv: bool) {
+    fn test_wal(dir: &str, name: &str, lsn_limit: u64, adv: bool, do_clean: bool) {
         let dir = AsRef::<Path>::as_ref(dir).to_path_buf();
         let mut rng = rand::rng();
         let mut bufs = Vec::<Bytes>::new();
@@ -987,6 +1014,7 @@ mod tests {
         let mut max_wlsn = 0u64;
         let mut log_map = BTreeMap::<u64, Bytes>::new();
         let mut max_adv_lsn = 0u64;
+        let mut total_wbytes = 0u64;
         for handle in handles {
             let res = handle.join().unwrap();
             if res.1 > 0 {
@@ -999,6 +1027,7 @@ mod tests {
                 if max_wlsn < log.lsn {
                     max_wlsn = log.lsn;
                 }
+                total_wbytes += log.payload.len() as u64;
                 log_map.insert(log.lsn, log.payload);
             }
         }
@@ -1019,11 +1048,17 @@ mod tests {
             flashed_lsn = writer.get_max_lsn();
         }
         println!("wduration: {:?}", wstart_time.elapsed());
+
+        println!(
+            "info: max_wlsn={}, total_wbytes={}, wduration={:?}",
+            max_wlsn,
+            total_wbytes,
+            wstart_time.elapsed()
+        );
         let inst = Arc::try_unwrap(writer).unwrap().stop();
         let rstart_time = Instant::now();
         let reader = inst.open_wal_reader().unwrap();
         let min_rlsn = reader.get_min_lsn();
-        println!("debug: min_rlsn={}", min_rlsn);
         assert!(min_rlsn <= max_adv_lsn + 1);
         let iter = reader.get_log_iter(min_rlsn).unwrap();
         let mut max_rlsn = 0u64;
@@ -1057,55 +1092,119 @@ mod tests {
             total_rbytes,
             rstart_time.elapsed()
         );
-        let names =
-            StdFileIoBackend::list_files(&dir, Some(|n: &str| n.starts_with(name))).unwrap();
-        for n in names {
-            let p = &dir.join(&n);
-            StdFileIoBackend::remove_file(p).unwrap();
+        if do_clean {
+            let names =
+                StdFileIoBackend::list_files(&dir, Some(|n: &str| n.starts_with(name))).unwrap();
+            for n in names {
+                let p = &dir.join(&n);
+                StdFileIoBackend::remove_file(p).unwrap();
+            }
         }
     }
 
     #[test]
     fn test_wal_mem_small_adv() {
-        test_wal("/dev/shm", "test_wal_mem_small_adv_sync", 10000, true);
+        test_wal("/dev/shm", "test_wal_mem_small_adv_sync", 10000, true, true);
     }
 
     #[test]
     fn test_wal_mem_small_noadv() {
-        test_wal("/dev/shm", "test_wal_mem_small_noadv_sync", 10000, false);
+        test_wal(
+            "/dev/shm",
+            "test_wal_mem_small_noadv_sync",
+            10000,
+            false,
+            true,
+        );
     }
 
     #[test]
     fn test_wal_disk_small_adv() {
-        test_wal("/tmp", "test_wal_disk_small_adv_sync", 10000, true);
+        test_wal("/tmp", "test_wal_disk_small_adv_sync", 10000, true, true);
     }
 
     #[test]
     fn test_wal_disk_small_noadv() {
-        test_wal("/tmp", "test_wal_disk_small_noadv_sync", 10000, false);
+        test_wal("/tmp", "test_wal_disk_small_noadv_sync", 10000, false, true);
     }
 
     #[test]
     #[ignore]
     fn test_wal_mem_large_adv() {
-        test_wal("/dev/shm", "test_wal_mem_large_adv_sync", 1000000, true);
+        test_wal(
+            "/dev/shm",
+            "test_wal_mem_large_adv_sync",
+            1000000,
+            true,
+            true,
+        );
     }
 
     #[test]
     #[ignore]
     fn test_wal_mem_large_noadv() {
-        test_wal("/dev/shm", "test_wal_mem_large_noadv_sync", 1000000, false);
+        test_wal(
+            "/dev/shm",
+            "test_wal_mem_large_noadv_sync",
+            1000000,
+            false,
+            true,
+        );
     }
 
     #[test]
     #[ignore]
     fn test_wal_disk_large_adv() {
-        test_wal("/tmp", "test_wal_disk_large_adv_sync", 1000000, true);
+        test_wal("/tmp", "test_wal_disk_large_adv_sync", 1000000, true, true);
     }
 
     #[test]
     #[ignore]
     fn test_wal_disk_large_noadv() {
-        test_wal("/tmp", "test_wal_disk_large_noadv_sync", 1000000, false);
+        test_wal(
+            "/tmp",
+            "test_wal_disk_large_noadv_sync",
+            1000000,
+            false,
+            true,
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn test_wal_mem_large_adv_twice() {
+        test_wal(
+            "/dev/shm",
+            "twice_test_wal_mem_large_adv_sync",
+            1000000,
+            true,
+            false,
+        );
+        test_wal(
+            "/dev/shm",
+            "twice_test_wal_mem_large_adv_sync",
+            2000000,
+            true,
+            true,
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn test_wal_disk_large_adv_twice() {
+        test_wal(
+            "/tmp",
+            "twice_test_wal_disk_large_adv_sync",
+            1000000,
+            true,
+            false,
+        );
+        test_wal(
+            "/tmp",
+            "twice_test_wal_disk_large_adv_sync",
+            2000000,
+            true,
+            true,
+        );
     }
 }

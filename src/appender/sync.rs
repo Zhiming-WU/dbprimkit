@@ -15,8 +15,11 @@
 //! ```
 use crate::io::{IoBackend, OpenOptions, StdFileIoBackend, Syncable};
 use crate::{Error, Result};
+use io_uring::{IoUring, opcode, squeue::Flags, types};
 use std::io::Write;
 use std::marker::PhantomData;
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::raw::c_void;
 use std::path::{Path, PathBuf};
 
 /// A provider to provide the new rotation name or list the ratation names.
@@ -281,9 +284,28 @@ impl<IO: IoBackend, RNP: RotNameProvider<IO>> Rotator<IO> for DefaultRotator<IO,
 pub type DefaultStdFileRotator =
     DefaultRotator<StdFileIoBackend, DefaultRotNameProvider<StdFileIoBackend>>;
 
+struct UringWriter {
+    ring: IoUring,
+    fd: types::Fd,
+    buf_reged: bool,
+}
+
+impl UringWriter {
+    fn new(raw_fd: RawFd) -> Result<Self> {
+        let ring = IoUring::new(2)?;
+        let fd = types::Fd(raw_fd);
+        Ok(Self {
+            ring,
+            fd,
+            buf_reged: false,
+        })
+    }
+}
+
 /// An appender with ratation support.
 pub struct RotAppender<IO: IoBackend, R: Rotator<IO>> {
     direct_io: bool,
+    io_uring: Option<UringWriter>,
     esize: u64,
     rot: R,
     writer: IO::Writer,
@@ -296,10 +318,17 @@ impl<IO: IoBackend, R: Rotator<IO>> RotAppender<IO, R> {
     /// Parameters:
     /// - `rotator`: The [Rotator] which controls the rotations.
     /// - `direct_io`: Whether direct IO is applied. It relies on the IO backend support.
-    pub fn new(mut rot: R, direct_io: bool) -> Result<Self> {
+    pub fn new(mut rot: R, direct_io: bool, try_io_uring: bool) -> Result<Self> {
         let writer = rot.init_appending(direct_io)?;
+        let mut io_uring = None;
+        if try_io_uring {
+            if let Ok(uring) = UringWriter::new(writer.0.as_raw_fd()) {
+                io_uring = Some(uring);
+            }
+        }
         Ok(Self {
             direct_io,
+            io_uring,
             esize: writer.1,
             rot,
             writer: writer.0,
@@ -346,6 +375,76 @@ impl<IO: IoBackend, R: Rotator<IO>> RotAppender<IO, R> {
     /// Get a reference to the inner [Rotator] (for listing ratations, reading from a rotation, etc.).
     pub fn get_rotator(&self) -> &R {
         &self.rot
+    }
+
+    pub(crate) fn uring_is_used(&self) -> bool {
+        self.io_uring.is_some()
+    }
+
+    pub(crate) fn uring_register_buf(&mut self, buf: &mut [u8], len: usize) -> Result<()> {
+        self.uring_unregister_buf();
+        let uring = self.io_uring.as_mut().unwrap();
+        let iovec = libc::iovec {
+            iov_base: buf.as_mut_ptr() as *mut c_void,
+            iov_len: len,
+        };
+        println!("debug: ptr={:?}, len={}", iovec.iov_base, iovec.iov_len);
+        unsafe { uring.ring.submitter().register_buffers(&[iovec]).unwrap() };
+        uring.buf_reged = true;
+        Ok(())
+    }
+
+    pub(crate) fn uring_unregister_buf(&mut self) {
+        let uring = self.io_uring.as_mut().unwrap();
+        if uring.buf_reged {
+            let _ = uring.ring.submitter().unregister_buffers();
+            uring.buf_reged = false;
+        }
+    }
+
+    fn uring_append_flush_inner(
+        uring: &mut UringWriter,
+        offset: u64,
+        payload: &[u8],
+    ) -> Result<()> {
+        let write_sqe =
+            opcode::WriteFixed::new(uring.fd, payload.as_ptr(), payload.len() as u32, 0)
+                .offset(u64::MAX)
+                .build()
+                .flags(Flags::IO_LINK)
+                .user_data(0x01);
+        let sync_seq = opcode::Fsync::new(uring.fd).build().user_data(0x02);
+        unsafe {
+            uring.ring.submission().push(&write_sqe).unwrap();
+            uring.ring.submission().push(&sync_seq).unwrap();
+        }
+        uring.ring.submit_and_wait(2).unwrap();
+        let mut cq = uring.ring.completion();
+        let cqe_write = cq.next().unwrap();
+        let written = cqe_write.result();
+        //println!("uring_append_flush_inner: written={written}");
+        let cqe_sync = cq.next().unwrap();
+        let sync_res = cqe_sync.result();
+        //println!("uring_append_flush_inner: sync_res={sync_res}");
+        Ok(())
+    }
+
+    pub(crate) fn uring_append_flush(&mut self, payload: &[u8], rotatable: bool) -> Result<bool> {
+        let uring = self.io_uring.as_mut().unwrap();
+        let asize = payload.len() as u64;
+        //println!("uring_append_flush: esize={}, asize={}", self.esize, asize);
+        Self::uring_append_flush_inner(uring, self.esize, payload)?;
+        self.esize += asize;
+        let mut new_rot = false;
+        if rotatable && self.rot.needs_new_rot(self.esize) {
+            self.writer = self.rot.new_rot(self.direct_io)?;
+            if let Some(uring) = &mut self.io_uring {
+                uring.fd = types::Fd(self.writer.as_raw_fd());
+            }
+            self.esize = 0;
+            new_rot = true;
+        }
+        Ok(new_rot)
     }
 }
 
@@ -450,7 +549,7 @@ mod tests {
     fn test_rot_appender() {
         let capa = 3072usize;
         let rotator = DefaultStdFileRotator::new("/tmp", "ra_test_sync.", 3, 8096).unwrap();
-        let mut appender = StdFileRotAppender::new(rotator, false).unwrap();
+        let mut appender = StdFileRotAppender::new(rotator, false, false).unwrap();
         let mut buf_mut = BytesMut::with_capacity(capa);
         unsafe { buf_mut.set_len(capa) };
         let mut rng = rand::rng();
@@ -484,7 +583,7 @@ mod tests {
             assert_eq!(rd_buf_mut.split_to(capa).freeze(), buf);
         }
         let rotator = DefaultStdFileRotator::new("/tmp", "ra_test_sync.", 3, 8096).unwrap();
-        let mut appender = StdFileRotAppender::new(rotator, false).unwrap();
+        let mut appender = StdFileRotAppender::new(rotator, false, false).unwrap();
         while idx < 32 {
             appender.append(&buf.clone(), true).unwrap();
             idx += 1;

@@ -5,7 +5,7 @@ edition = "2024"
 repository = "https://github.com/Zhiming-WU/dbprimkit.git"
 license = "MIT"
 readme = "README.md"
-description = "A kit aims to provide simple implementations for several database primitives (Work In Progress)"
+description = "A kit aiming to provide simple implementations for several database primitives (Work In Progress)"
 documentation = "https://docs.rs/dbprimkit"
 
 [dependencies]
@@ -13,6 +13,7 @@ async-stream = {version = "0.3", optional = true }
 bytes = "1.12"
 crc32c = "0.6"
 futures = {version = "0.3", optional = true }
+io-uring = { version = "0.7", features = ["direct-syscall"] }
 libc = "0.2"
 rand = "0.10"
 thiserror = "2.0"
