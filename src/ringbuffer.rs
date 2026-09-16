@@ -129,7 +129,7 @@ impl<T> RingBuffer<T> {
             self.tail.0.store(tail + 1, Ordering::Relaxed);
             Ok((v, tail & self.mask))
         } else {
-            return Err(Error::RingBufferFull);
+            Err(Error::RingBufferFull)
         }
     }
 

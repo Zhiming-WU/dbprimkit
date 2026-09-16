@@ -40,7 +40,9 @@ async fn main() {
         bufs.push(bm.freeze());
     }
 
-    let inst = TokioFileWalInstance::new(name, dir.as_path());
+    let inst = TokioFileWalInstance::new(name, dir.as_path(), None)
+        .await
+        .unwrap();
     let writer = Arc::new(inst.open_wal_writer().await.unwrap());
 
     let wstart_time = Instant::now();

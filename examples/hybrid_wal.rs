@@ -43,7 +43,7 @@ async fn main() {
         bufs.push(bm.freeze());
     }
 
-    let inst = StdFileWalInstance::new(name, dir.as_path());
+    let inst = StdFileWalInstance::new(name, dir.as_path(), None).unwrap();
     let writer = Arc::new(inst.open_wal_writer().unwrap());
 
     let wstart_time = Instant::now();
@@ -136,7 +136,9 @@ async fn main() {
     Arc::try_unwrap(writer).unwrap().stop();
 
     let rstart_time = Instant::now();
-    let inst = TokioFileWalInstance::new(name, dir.as_path());
+    let inst = TokioFileWalInstance::new(name, dir.as_path(), None)
+        .await
+        .unwrap();
     let reader = inst.open_wal_reader().await.unwrap();
     let min_rlsn = reader.get_min_lsn();
     assert!(min_rlsn <= max_adv_lsn + 1);

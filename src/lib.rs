@@ -1,23 +1,23 @@
-//! This crate provides simple implementations for several database primitives (Work In Progress).
+//! This crate aims to provide simple implementations for several database primitives (Work In Progress).
 //!
 //! Currently below items are thought to be available, but NOTE they may be changed in the future,
 //! including their interfaces).
 //! - [ringbuffer]
 //! - [appender]
-//! - [wal]
+//! - [wal] (Write Ahead Log)
 
 use std::alloc::{Layout, alloc, dealloc};
 use std::ptr::NonNull;
 
 pub mod appender;
-pub mod arena;
-pub mod bloomfilter;
-pub mod btree; // B+ Tree
+//pub mod arena;
+//pub mod bloomfilter;
+//pub mod btree; // B+ Tree
 pub mod io;
 //pub mod cbtree; // classic B Tree
-pub mod lsm;
+//pub mod lsm;
 pub mod ringbuffer;
-pub mod skiptable;
+//pub mod skiptable;
 pub mod wal; // Write Ahead Log
 
 #[derive(thiserror::Error, Debug)]

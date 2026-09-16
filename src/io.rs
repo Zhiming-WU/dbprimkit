@@ -50,7 +50,7 @@ pub trait Syncable {
 
 impl Syncable for std::fs::File {
     fn sync_all(&self) -> Result<()> {
-        Ok(std::fs::File::sync_all(&self)?)
+        Ok(std::fs::File::sync_all(self)?)
     }
 }
 
@@ -152,7 +152,7 @@ impl IoBackend for StdFileIoBackend {
                 if let Ok(typ) = e.file_type() {
                     if typ.is_file() {
                         if let Some(file_name) = e.file_name().to_str() {
-                            if filter.as_ref().map_or(true, |f| f(file_name)) {
+                            if filter.as_ref().is_none_or(|f| f(file_name)) {
                                 out.push(file_name.to_string());
                             }
                         }
@@ -181,7 +181,7 @@ pub trait AsyncSyncable {
 
 impl AsyncSyncable for tokio::fs::File {
     async fn sync_all(&self) -> Result<()> {
-        Ok(tokio::fs::File::sync_all(&self).await?)
+        Ok(tokio::fs::File::sync_all(self).await?)
     }
 }
 
@@ -301,7 +301,7 @@ impl AsyncIoBackend for TokioFileIoBackend {
             if let Ok(typ) = e.file_type().await {
                 if typ.is_file() {
                     if let Some(file_name) = e.file_name().to_str() {
-                        if filter.as_ref().map_or(true, |f| f(file_name)) {
+                        if filter.as_ref().is_none_or(|f| f(file_name)) {
                             out.push(file_name.to_string());
                         }
                     }

@@ -40,7 +40,7 @@ fn main() {
         bufs.push(bm.freeze());
     }
 
-    let inst = StdFileWalInstance::new(name, dir.as_path());
+    let inst = StdFileWalInstance::new(name, dir.as_path(), None).unwrap();
     let writer = Arc::new(inst.open_wal_writer().unwrap());
 
     let wstart_time = Instant::now();

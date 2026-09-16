@@ -74,10 +74,10 @@ impl<IO: AsyncIoBackend + Sync> RotNameProvider<IO> for DefaultRotNameProvider<I
             return Ok(None);
         }
         let name = names.remove(names.len() - 1);
-        if let Some(sub) = name.get(self.prefix.len()..) {
-            if let Ok(no) = sub.parse::<u32>() {
-                return Ok(Some((no, name)));
-            }
+        if let Some(sub) = name.get(self.prefix.len()..)
+            && let Ok(no) = sub.parse::<u32>()
+        {
+            return Ok(Some((no, name)));
         }
         Err(Error::MiscError(format!(
             "Failed to restore rotation number from `{}`",
@@ -266,7 +266,6 @@ impl<IO: AsyncIoBackend + Sync + Send, RNP: RotNameProvider<IO> + Sync + Send> R
     async fn new_rot(&mut self, direct_io: bool) -> Result<IO::Writer> {
         let rot_names = self.list_rot_names().await?;
         if self.max_rot != 0 && rot_names.len() >= self.max_rot as usize {
-            println!("Removing oldest rot, name={}", &rot_names[0]);
             self.remove_rot(&rot_names[0]).await?;
         }
         let next_no = self.cur_rot_no + 1;
@@ -344,7 +343,7 @@ impl<IO: AsyncIoBackend, R: Rotator<IO>> RotAppender<IO, R> {
     /// Parameters:
     /// - `payload`: The payload to be appneded.
     /// - `rotatable`: Whether rotation switching is allowed after this payload. Usually it's `true` but sometimes
-    /// it's `false` for some reason (i.g. data integrity).
+    ///   it's `false` for some reason (i.g. data integrity).
     pub async fn append(&mut self, payload: &[u8], rotatable: bool) -> Result<bool> {
         let mut new_rot = false;
         let asize = payload.len() as u64;

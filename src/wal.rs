@@ -1,24 +1,34 @@
 //! A simple WAL (Write Ahead Log) implementation. See [sync] and [async] for more information.
 //!
-//! For use as writer, usually [sync::WalInstance] has a better performance
-//! than [async::WalInstance] since a dedicated flushing thread is used to
+//! For use as writer, usually [sync::StdFileWalInstance] has a better performance
+//! than [async::TokioFileWalInstance] since a dedicated flushing thread is used to
 //! avoid the transfering overheads between the flushing task and tokio blocking IO threads.
 //!
 //! After opened, the [sync::WalWriter] can be used in async code since it has no
 //! time-consuming blocking method.
+//!
+//! To tune the configuration, provide a [TunableConfig] to [sync::WalInstance::new] or [async::WalInstance::new].
+//! A default configuration is used if none is provided.
+//! The configuration is persisted and restored from the next time you create the WAL instance with the same name and
+//! directory. The value of some items can be changed between WAL instance creations, while the persisted value is
+//! always used for other items(like [TunableConfig::block_size]), unless the persisted configuration file is removed.
+//! <br/>When possible, the value of a item may be sanitized to a proper value without returning a error.
+//!
+//! Note that, for performance consideration, persisting advanced LSN is designed to be asynchronized
+//! ([sync::WalWriter::advance_lsn] and [async::WalWriter::advance_lsn] returns before the LSN is persisted), so there's
+//! possibility the advanced LSN is lost if crash occurs, which means [sync::WalReader::get_min_lsn] and
+//! [async::WalReader::get_min_lsn] may get a smaller value and some unneeded log entries are retrieved.
 
 use crate::{CacheAligned, Error, Result};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, atomic::AtomicU64};
 
 const MAX_MANI_ROT: u32 = 2;
-const MAX_MANI_ROT_SIZE: u64 = 1024 * 1024;
-const MAX_DATA_ROT_SIZE: u64 = 32 * 1024 * 1024;
-const BLOCK_SIZE: usize = 64 * 1024;
-const BLOCK_MASK: usize = BLOCK_SIZE - 1;
+const MAX_MANI_ROT_SIZE: u64 = 64 * 1024;
 
 /// A log entry, with a LSN (Log Sequence Number) and a payload of bytes.
 pub struct LogEntry {
@@ -45,13 +55,8 @@ unsafe impl Send for LogRingBuffer {}
 unsafe impl Sync for LogRingBuffer {}
 
 impl LogRingBuffer {
-    pub fn new(size_order: u8, lsn_base: u64) -> Result<Self> {
+    pub fn new(size_order: u8, lsn_base: u64) -> Self {
         let size = 1usize << size_order;
-        let max_isize = isize::MAX as usize;
-        if size > max_isize {
-            return Err(Error::InvalidArgument("`size_order` is too large".into()));
-        }
-
         let mut buf = Vec::with_capacity(size);
         for i in 0..size {
             buf.push(LogRingBufferCell {
@@ -60,13 +65,13 @@ impl LogRingBuffer {
             });
         }
 
-        Ok(Self {
+        Self {
             lsn_base,
             buf: buf.into_boxed_slice(),
             mask: size - 1,
             head: CacheAligned::<AtomicUsize>(AtomicUsize::new(0)),
             tail: CacheAligned::<AtomicUsize>(AtomicUsize::new(0)),
-        })
+        }
     }
 
     pub fn push(&self, log: Bytes) -> Result<u64> {
@@ -126,17 +131,19 @@ struct ControlBlock {
     max_lsn: AtomicU64,
     flush_lsn: Arc<AtomicU64>,
     rbuf: LogRingBuffer,
+    config: TunableConfig,
 }
 
 impl ControlBlock {
-    fn new(min_lsn: u64, max_lsn: u64, flush_lsn: Arc<AtomicU64>) -> Self {
+    fn new(min_lsn: u64, max_lsn: u64, flush_lsn: Arc<AtomicU64>, config: TunableConfig) -> Self {
         let base_lsn = max_lsn + 1;
         Self {
             running: AtomicBool::new(false),
             min_lsn: AtomicU64::new(min_lsn),
             max_lsn: AtomicU64::new(max_lsn),
             flush_lsn,
-            rbuf: LogRingBuffer::new(8, base_lsn).unwrap(),
+            rbuf: LogRingBuffer::new(config.ringbuf_size_order, base_lsn),
+            config,
         }
     }
 }
@@ -163,54 +170,26 @@ impl TryFrom<u8> for Fullness {
     }
 }
 
-#[derive(Clone, Copy)]
+/*#[derive(Clone, Copy)]
 #[repr(u8)]
 pub(crate) enum WalFlags {
     Zipped = 0x01,
-}
+}*/
 
 pub(crate) struct DiskLogEntry {
     payload: Bytes,
-    crc: u32,
-    len: u32,
+    _crc: u32,
+    _len: u32,
     lsn: u64,
-    ver: u8,
+    _ver: u8,
     fullness: Fullness,
-    flags: u8,
-    resv: u8,
+    _flags: u8,
+    _resv: u8,
 }
 
 const LOG_HEAD_SIZE: usize = 20;
 
 impl DiskLogEntry {
-    fn new(lsn: u64, payload: Bytes, fullness: Fullness) -> Self {
-        let len = payload.len();
-        Self {
-            payload: payload,
-            crc: 0,
-            len: len as u32,
-            lsn,
-            ver: 0,
-            fullness,
-            flags: 0,
-            resv: 0,
-        }
-    }
-
-    fn encode_self(&self, buf: &mut BytesMut) {
-        let ostart = buf.len();
-        buf.put_bytes(0, 4);
-        buf.put_u32_ne(self.len);
-        buf.put_u64_ne(self.lsn);
-        buf.put_u8(self.ver);
-        buf.put_u8(self.fullness as u8);
-        buf.put_u8(self.flags as u8);
-        buf.put_u8(self.resv);
-        buf.extend_from_slice(&self.payload);
-        let crc = crc32c::crc32c(&buf[(ostart + 4)..]);
-        buf[ostart..(ostart + 4)].copy_from_slice(&crc.to_ne_bytes());
-    }
-
     fn encode(buf: &mut Vec<u8>, lsn: u64, payload: Bytes, fullness: Fullness) {
         let ostart = buf.len();
         buf.put_bytes(0, 4);
@@ -260,54 +239,34 @@ impl DiskLogEntry {
 
         Ok(Self {
             payload,
-            crc: recv_crc,
-            len: entry_len as u32,
+            _crc: recv_crc,
+            _len: entry_len as u32,
             lsn,
-            ver,
+            _ver: ver,
             fullness,
-            flags,
-            resv,
+            _flags: flags,
+            _resv: resv,
         })
     }
 }
 
 pub(crate) struct DiskBlockHeader {
-    crc: u32,
-    ver: u8,
-    resv: [u8; 3],
-    min_lsn: u64,
-    max_lsn: u64,
-}
-
-impl Default for DiskBlockHeader {
-    fn default() -> Self {
-        Self {
-            crc: 0u32,
-            ver: 0,
-            resv: [0u8; 3],
-            min_lsn: 0,
-            max_lsn: 0,
-        }
-    }
+    _crc: u32,
+    _ver: u8,
+    _resv: [u8; 3],
+    min_lsn: u64,       // min LSN in this block
+    max_lsn: u64,       // max LSN in this block
+    whole_min_lsn: u64, // min LSN in the whole WAL instance
 }
 
 const BLOCK_HEAD_SIZE: usize = std::mem::size_of::<DiskBlockHeader>();
 
 impl DiskBlockHeader {
-    fn encode_self(&self, buf: &mut BytesMut) {
-        buf.put_bytes(0, 4);
-        buf.put_u8(self.ver);
-        buf.put(&self.resv[..]);
-        buf.put_u64_ne(self.min_lsn);
-        buf.put_u64_ne(self.max_lsn);
-        let crc = crc32c::crc32c(&buf[4..]);
-        buf[0..4].copy_from_slice(&crc.to_ne_bytes());
-    }
-
     fn encode(buf: &mut Vec<u8>, min_lsn: u64) {
         buf.put_u64_ne(0);
         buf.put_u64_ne(min_lsn);
-        buf.put_u64_ne(0);
+        buf.put_u64_ne(0); // place holder for max_lsn
+        buf.put_u64_ne(0); // place holder for whole_min_lsn
     }
 
     fn decode_err(details: &str) -> Result<Self> {
@@ -341,35 +300,33 @@ impl DiskBlockHeader {
 
         let min_lsn = src.get_u64_ne();
         let max_lsn = src.get_u64_ne();
+        let whole_min_lsn = src.get_u64_ne();
 
         Ok(Self {
-            crc: recv_crc,
-            ver,
-            resv,
+            _crc: recv_crc,
+            _ver: ver,
+            _resv: resv,
             min_lsn,
             max_lsn,
+            whole_min_lsn,
         })
     }
 }
 
 struct DiskManiEntry {
-    crc: u32,
-    ver: u8,
-    resv: [u8; 3],
+    _crc: u32,
+    _ver: u8,
+    _resv: [u8; 3],
     min_lsn: u64,
-    min_rot: u32,
-    max_rot: u32,
 }
 
 impl Default for DiskManiEntry {
     fn default() -> Self {
         Self {
-            crc: 0u32,
-            ver: 0,
-            resv: [0u8; 3],
+            _crc: 0u32,
+            _ver: 0,
+            _resv: [0u8; 3],
             min_lsn: 0,
-            min_rot: 0,
-            max_rot: 0,
         }
     }
 }
@@ -377,22 +334,9 @@ impl Default for DiskManiEntry {
 const MANI_ENTRY_SIZE: usize = std::mem::size_of::<DiskManiEntry>();
 
 impl DiskManiEntry {
-    fn encode(&self, buf: &mut BytesMut) {
-        buf.put_bytes(0, 4);
-        buf.put_u8(self.ver);
-        buf.put(&self.resv[..]);
-        buf.put_u64_ne(self.min_lsn);
-        buf.put_u32_ne(self.min_rot);
-        buf.put_u32_ne(self.max_rot);
-        let crc = crc32c::crc32c(&buf[4..]);
-        buf[0..4].copy_from_slice(&crc.to_ne_bytes());
-    }
-
-    fn encode_by_params(buf: &mut BytesMut, min_lsn: u64) {
+    fn encode(buf: &mut BytesMut, min_lsn: u64) {
         buf.put_u64_ne(0);
         buf.put_u64_ne(min_lsn);
-        buf.put_u32_ne(0);
-        buf.put_u32_ne(0);
         let crc = crc32c::crc32c(&buf[4..]);
         buf[0..4].copy_from_slice(&crc.to_ne_bytes());
     }
@@ -421,29 +365,90 @@ impl DiskManiEntry {
         src.copy_to_slice(&mut resv);
 
         let min_lsn = src.get_u64_ne();
-        let min_rot = src.get_u32_ne();
-        let max_rot = src.get_u32_ne();
 
         Ok(Self {
-            crc: recv_crc,
-            ver,
-            resv,
+            _crc: recv_crc,
+            _ver: ver,
+            _resv: resv,
             min_lsn,
-            min_rot,
-            max_rot,
         })
     }
 }
 
-/// Currently not implemented.
-pub struct TunnableConfig {
-    pub max_mani_rot: u32,
-    pub max_mani_rot_size: u64,
-    pub max_data_rot: u32,
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+/// Tunable configuration items for WAL instance.
+pub struct TunableConfig {
+    /// The size indicator (power of 2) of the ring buffer used by the flushing task to receive log entries.
+    /// The default value is 8, which means the size is 256 entries.
+    pub ringbuf_size_order: u8,
+    /// The threshold size to switch to new data rotation. The default is 32MB (`32*1024*1024`).
     pub max_data_rot_size: u64,
-    pub log_flush_sleep_thres: u32,
-    pub log_flush_sleep_interval: u32,
-    pub log_flush_disturb_thres: u32,
+    /// The maximum allowed size of a log entry. The default is 1MB (`1024*1024`).
+    pub max_log_entry_size: u32,
+    /// The block size. Log data is organized as logical blocks to quicker locate the log entry.
+    /// It must be a power of 2, at range of [4KB, 256KB]. The default block size is 64KB (`64*1024`).
+    pub block_size: u32,
+    /// The buffer size to flush the log data in bulk. It should be both a multiple of the block size and
+    /// a power of 2, at the range of [block_size, 1MB]. The default block size is 256KB (`256*1024`).
+    pub bulk_flush_size: u32,
+    /// Number of checks for new log entries before flushing an non-full flushing buffer. The default
+    /// value is 5.
+    pub checks_bef_flush_log: u32,
+    /// Number of checks for new advanced LSN before persisting the advanced LSN. The default value is 0.
+    pub checks_bef_flush_adv_lsn: u32,
+}
+
+impl TunableConfig {
+    fn from_opt(config: Option<TunableConfig>) -> Self {
+        if let Some(mut config) = config {
+            config.sanitize();
+            config
+        } else {
+            TunableConfig::default()
+        }
+    }
+
+    fn sanitize(&mut self) {
+        self.block_size = if let Some(size) = self.block_size.checked_next_power_of_two() {
+            size
+        } else {
+            256 * 1024
+        };
+        if self.block_size < 4096 {
+            self.block_size = 4096;
+        } else if self.block_size > 256 * 1024 {
+            self.block_size = 256 * 1024;
+        }
+        if self.bulk_flush_size % self.block_size != 0 {
+            self.bulk_flush_size =
+                ((self.bulk_flush_size + self.block_size - 1) / self.block_size) * self.block_size;
+        }
+        self.bulk_flush_size = if let Some(size) = self.bulk_flush_size.checked_next_power_of_two()
+        {
+            size
+        } else {
+            1024 * 1024
+        };
+        if self.bulk_flush_size < self.block_size {
+            self.bulk_flush_size = self.block_size;
+        } else if self.bulk_flush_size > 1024 * 1024 {
+            self.bulk_flush_size = 1024 * 1024;
+        }
+    }
+}
+
+impl Default for TunableConfig {
+    fn default() -> Self {
+        Self {
+            ringbuf_size_order: 8,
+            max_data_rot_size: 32 * 1024 * 1024,
+            max_log_entry_size: 1024 * 1024,
+            block_size: 64 * 1024,
+            bulk_flush_size: 256 * 1024,
+            checks_bef_flush_log: 5,
+            checks_bef_flush_adv_lsn: 0,
+        }
+    }
 }
 
 #[cfg(feature = "async")]
@@ -456,31 +461,27 @@ mod tests {
     use rand::RngExt;
 
     fn test_encode_decode_disk_mani_entry() {
-        let mut entry = DiskManiEntry::default();
-        entry.min_lsn = 0x1234567890abcdef;
-        entry.max_rot = 0x12345678;
-        entry.min_rot = 0x87654321;
         let mut buf = BytesMut::with_capacity(MANI_ENTRY_SIZE);
-        entry.encode(&mut buf);
+        DiskManiEntry::encode(&mut buf, 0x1234567890abcdef);
         let mut buf = buf.freeze();
         assert_eq!(buf.len(), MANI_ENTRY_SIZE);
         let decoded = DiskManiEntry::decode(&mut buf).unwrap();
-        assert_eq!(entry.min_lsn, decoded.min_lsn);
-        assert_eq!(entry.min_lsn, decoded.min_lsn);
-        assert_eq!(entry.min_lsn, decoded.min_lsn);
+        assert_eq!(0x1234567890abcdef, decoded.min_lsn);
     }
 
     fn test_encode_decode_disk_block_header() {
-        let mut entry = DiskBlockHeader::default();
-        entry.min_lsn = 0x1234567890abcdef;
-        entry.max_lsn = 0xfedcba9876543210;
-        let mut buf = BytesMut::with_capacity(BLOCK_HEAD_SIZE);
-        entry.encode_self(&mut buf);
-        let mut buf = buf.freeze();
+        let mut buf = Vec::with_capacity(BLOCK_HEAD_SIZE);
+        DiskBlockHeader::encode(&mut buf, 0x1234567890abcdefu64);
+        buf[16..24].copy_from_slice(&0xfedcba9876543210u64.to_ne_bytes());
+        buf[24..32].copy_from_slice(&0x7777777788888888u64.to_ne_bytes());
+        let crc = crc32c::crc32c(&buf[4..32]);
+        buf[0..4].copy_from_slice(&crc.to_ne_bytes());
         assert_eq!(buf.len(), BLOCK_HEAD_SIZE);
-        let decoded = DiskBlockHeader::decode(&mut buf).unwrap();
-        assert_eq!(entry.min_lsn, decoded.min_lsn);
-        assert_eq!(entry.max_lsn, decoded.max_lsn);
+        let mut bytes = Bytes::from(buf);
+        let decoded = DiskBlockHeader::decode(&mut bytes).unwrap();
+        assert_eq!(0x1234567890abcdefu64, decoded.min_lsn);
+        assert_eq!(0xfedcba9876543210u64, decoded.max_lsn);
+        assert_eq!(0x7777777788888888u64, decoded.whole_min_lsn);
     }
 
     fn gen_random_bytes(max_len: usize) -> Bytes {
@@ -496,22 +497,25 @@ mod tests {
         let p1 = gen_random_bytes(64 * 1024);
         let p2 = gen_random_bytes(64 * 1024);
         let len = 2 * LOG_HEAD_SIZE + p1.len() + p2.len();
-        let e1 = DiskLogEntry::new(0x1234567890abcdef, p1, Fullness::Full);
-        let e2 = DiskLogEntry::new(0xfedcba9876543210, p2, Fullness::Middle);
-        let mut buf = BytesMut::with_capacity(len);
-        e1.encode_self(&mut buf);
-        e2.encode_self(&mut buf);
-        let mut buf = buf.freeze();
-        let decoded1 = DiskLogEntry::decode(&mut buf).unwrap();
-        let decoded2 = DiskLogEntry::decode(&mut buf).unwrap();
-        assert_eq!(e1.lsn, decoded1.lsn);
-        assert_eq!(e1.len, decoded1.len);
-        assert_eq!(e1.fullness, decoded1.fullness);
-        assert_eq!(e1.payload, decoded1.payload);
-        assert_eq!(e2.lsn, decoded2.lsn);
-        assert_eq!(e2.len, decoded2.len);
-        assert_eq!(e2.fullness, decoded2.fullness);
-        assert_eq!(e2.payload, decoded2.payload);
+        let mut buf = Vec::with_capacity(len);
+        DiskLogEntry::encode(&mut buf, 0x1234567890abcdefu64, p1.clone(), Fullness::Full);
+        DiskLogEntry::encode(
+            &mut buf,
+            0xfedcba9876543210u64,
+            p2.clone(),
+            Fullness::Middle,
+        );
+        let mut bytes = Bytes::from(buf);
+        let decoded1 = DiskLogEntry::decode(&mut bytes).unwrap();
+        let decoded2 = DiskLogEntry::decode(&mut bytes).unwrap();
+        assert_eq!(0x1234567890abcdefu64, decoded1.lsn);
+        assert_eq!(p1.len() as u32, decoded1._len);
+        assert_eq!(Fullness::Full, decoded1.fullness);
+        assert_eq!(p1, decoded1.payload);
+        assert_eq!(0xfedcba9876543210u64, decoded2.lsn);
+        assert_eq!(p2.len() as u32, decoded2._len);
+        assert_eq!(Fullness::Middle, decoded2.fullness);
+        assert_eq!(p2, decoded2.payload);
     }
 
     #[test]
