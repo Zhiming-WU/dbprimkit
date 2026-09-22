@@ -1,7 +1,8 @@
 This crate aims to provide simple implementations for several database primitives (Work In Progress).
-
 Currently below items are thought to be available, but NOTE they may be changed in the future,
 including their interfaces).
 - [ringbuffer]
 - [appender]
-- [wal]
+- [skiptable::map::ordinary] (ordinary skip table map)
+- [sync::spinlock]
+- [wal] (Write Ahead Log)

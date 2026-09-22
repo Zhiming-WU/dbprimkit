@@ -4,6 +4,8 @@
 //! including their interfaces).
 //! - [ringbuffer]
 //! - [appender]
+//! - [skiptable::map::ordinary] (ordinary skip table map)
+//! - [sync::spinlock]
 //! - [wal] (Write Ahead Log)
 
 use std::alloc::{Layout, alloc, dealloc};
@@ -17,7 +19,8 @@ pub mod io;
 //pub mod cbtree; // classic B Tree
 //pub mod lsm;
 pub mod ringbuffer;
-//pub mod skiptable;
+pub mod skiptable;
+pub mod sync;
 pub mod wal; // Write Ahead Log
 
 #[derive(thiserror::Error, Debug)]
@@ -80,3 +83,60 @@ impl Drop for AlignedBuffer {
         unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
     }
 }
+
+// #[cfg(test)]
+// pub(crate) mod alloc_tests {
+//     use std::alloc::{GlobalAlloc, Layout, System};
+//     use std::sync::atomic::{AtomicIsize, Ordering};
+
+//     pub struct MyAlloc {
+//         pub(crate) bytes: AtomicIsize,
+//         pub(crate) count: AtomicIsize,
+//     }
+
+//     impl MyAlloc {
+//         pub const fn new() -> Self {
+//             Self {
+//                 bytes: AtomicIsize::new(0),
+//                 count: AtomicIsize::new(0),
+//             }
+//         }
+
+//         pub fn assert_no_leaks(&self) {
+//             assert_eq!(self.bytes.load(Ordering::Acquire), 0);
+//             assert_eq!(self.count.load(Ordering::Acquire), 0);
+//         }
+//     }
+
+//     unsafe impl GlobalAlloc for MyAlloc {
+//         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+//             unsafe {
+//                 let ptr = System.alloc(layout);
+//                 if !ptr.is_null() {
+//                     self.bytes
+//                         .fetch_add(layout.size() as isize, Ordering::SeqCst);
+//                     self.count.fetch_add(1, Ordering::SeqCst);
+//                 }
+//                 ptr
+//             }
+//         }
+
+//         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+//             unsafe {
+//                 System.dealloc(ptr, layout);
+//                 self.bytes
+//                     .fetch_sub(layout.size() as isize, Ordering::SeqCst);
+//                 self.count.fetch_sub(1, Ordering::SeqCst);
+//             }
+//         }
+//     }
+
+//     #[global_allocator]
+//     pub(crate) static ALLOC: MyAlloc = MyAlloc::new();
+// }
+
+// #[cfg(test)]
+// pub(crate) mod tests {
+//     #[test]
+//     fn test_dummy() {}
+// }

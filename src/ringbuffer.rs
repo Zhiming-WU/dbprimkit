@@ -11,11 +11,13 @@ use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[derive(Debug)]
 struct Cell<T> {
     seq: AtomicUsize,
     data: UnsafeCell<MaybeUninit<T>>,
 }
 
+#[derive(Debug)]
 pub struct RingBuffer<T> {
     buf: Box<[Cell<T>]>,
     mask: usize,
