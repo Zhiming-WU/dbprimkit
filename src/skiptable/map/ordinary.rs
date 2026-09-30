@@ -1,5 +1,5 @@
 //! A key-value map based on skip table, with APIs similar to [std::collections::BTreeMap].
-//! It's designed to used in non-concurrent mode and the user needs to use synchronization
+//! It's designed to be used in non-concurrent mode and the user needs to use synchronization
 //! utilities (i.g. locks) to use it in concurrent mode.
 //!
 //! Below is an example.
@@ -227,7 +227,7 @@ impl<K, V> SkipTableMap<K, V> {
     pub fn new(max_height: usize) -> Self {
         let max_height = max_height.min(32).max(1);
         let mut next = Vec::with_capacity(max_height);
-        for _ in 0..max_height as usize {
+        for _ in 0..max_height {
             next.push(std::ptr::null_mut());
         }
         Self {
@@ -255,7 +255,7 @@ impl<K, V> SkipTableMap<K, V> {
         K: Borrow<Q> + Ord,
     {
         let null: NodePtr = std::ptr::null_mut();
-        let mut level = self.max_height as usize - 1;
+        let mut level = self.max_height - 1;
         let mut next: NodePtr = null;
 
         'level_loop: loop {
@@ -307,7 +307,7 @@ impl<K, V> SkipTableMap<K, V> {
         K: Borrow<Q> + Ord,
     {
         let null: *mut u8 = std::ptr::null_mut();
-        let mut level = self.max_height as usize - 1;
+        let mut level = self.max_height - 1;
         let mut vec = PrecVec::new();
         let mut next: NodePtr = null;
         let mut res: NodePtr = null;
@@ -479,7 +479,7 @@ impl<K, V> SkipTableMap<K, V> {
         self.len
     }
 
-    /// Returns true if the map contains no elements.
+    /// Returns `true` if the map contains no elements.
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -488,7 +488,7 @@ impl<K, V> SkipTableMap<K, V> {
     pub fn clear(&mut self) {
         let null = std::ptr::null_mut();
         let mut node_ptr = self.next[0];
-        for level in 0..self.max_height as usize {
+        for level in 0..self.max_height {
             let next_addr = self.get_next_addr(level);
             set_next(next_addr, null);
         }
@@ -500,7 +500,7 @@ impl<K, V> SkipTableMap<K, V> {
         self.len = 0;
     }
 
-    /// Returns true if the map contains a value for the specified key.
+    /// Returns `true` if the map contains a value for the specified key.
     pub fn contains_key<Q>(&self, key: &Q) -> bool
     where
         Q: Ord + ?Sized,
@@ -614,7 +614,7 @@ impl<K, V> SkipTableMap<K, V> {
 
     fn search_last(&self) -> NodePtr {
         let null: *mut u8 = std::ptr::null_mut();
-        let mut level = self.max_height as usize - 1;
+        let mut level = self.max_height - 1;
         let mut next: NodePtr = null;
         let mut res: NodePtr = null;
 
@@ -695,7 +695,7 @@ impl<K, V> SkipTableMap<K, V> {
         K: Borrow<Q> + Ord,
     {
         let null: *mut u8 = std::ptr::null_mut();
-        let mut level = self.max_height as usize - 1;
+        let mut level = self.max_height - 1;
         let mut next: NodePtr = null;
         let mut res: NodePtr = null;
 
@@ -1104,7 +1104,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::alloc_tests::ALLOC;
+    //use crate::alloc_tests::ALLOC;
     use rand::Rng;
     //use std::sync::atomic::Ordering;
     use std::{collections::BTreeSet, time::Instant};

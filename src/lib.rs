@@ -52,6 +52,12 @@ pub enum Error {
     /// Some needed function (i.g. some backend) is not running.
     #[error("Function `{0}` is not running")]
     FunctionNotRunning(String),
+    #[error("Element is in use")]
+    ElementInUse,
+    #[error("Element is in mutable use")]
+    ElementInMutUse,
+    #[error("Element is deleted")]
+    ElementDeleted,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
