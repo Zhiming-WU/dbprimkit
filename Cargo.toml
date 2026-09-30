@@ -1,6 +1,6 @@
 [package]
 name = "dbprimkit"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 repository = "https://github.com/Zhiming-WU/dbprimkit.git"
 license = "MIT"
@@ -23,6 +23,9 @@ tokio = { version = "1.53", features = ["fs", "io-util", "macros", "rt", "rt-mul
 [features]
 default = ["async"]
 async = ["dep:async-stream", "dep:futures", "dep:tokio"]
+
+#[profile.dev]
+#panic = "abort"
 
 [profile.release]
 opt-level = 3

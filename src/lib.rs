@@ -4,11 +4,12 @@
 //! including their interfaces).
 //! - [ringbuffer]
 //! - [appender]
-//! - [skiptable::map::ordinary] (ordinary skip table map)
+//! - [skiptable::map] (skip table map)
 //! - [sync::spinlock]
 //! - [wal] (Write Ahead Log)
 
 use std::alloc::{Layout, alloc, dealloc};
+use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 
 pub mod appender;
@@ -52,6 +53,14 @@ pub enum Error {
     /// Some needed function (i.g. some backend) is not running.
     #[error("Function `{0}` is not running")]
     FunctionNotRunning(String),
+    #[error("Element is in use")]
+    ElementInUse,
+    #[error("Element is in mutable use")]
+    ElementInMutUse,
+    #[error("Element is deleted")]
+    ElementDeleted,
+    #[error("Element reference is not mutable")]
+    ElementRefNotMutable,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -59,6 +68,19 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug)]
 #[repr(align(64))]
 struct CacheAligned<T>(T);
+
+impl<T> Deref for CacheAligned<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> DerefMut for CacheAligned<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
 
 pub(crate) struct AlignedBuffer {
     ptr: NonNull<u8>,
@@ -84,56 +106,51 @@ impl Drop for AlignedBuffer {
     }
 }
 
-// #[cfg(test)]
-// pub(crate) mod alloc_tests {
-//     use std::alloc::{GlobalAlloc, Layout, System};
-//     use std::sync::atomic::{AtomicIsize, Ordering};
+#[cfg(test)]
+pub(crate) mod alloc_tests {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicIsize, Ordering};
 
-//     pub struct MyAlloc {
-//         pub(crate) bytes: AtomicIsize,
-//         pub(crate) count: AtomicIsize,
-//     }
+    pub struct MyAlloc {
+        pub(crate) bytes: AtomicIsize,
+        pub(crate) count: AtomicIsize,
+    }
 
-//     impl MyAlloc {
-//         pub const fn new() -> Self {
-//             Self {
-//                 bytes: AtomicIsize::new(0),
-//                 count: AtomicIsize::new(0),
-//             }
-//         }
+    impl MyAlloc {
+        pub const fn new() -> Self {
+            Self {
+                bytes: AtomicIsize::new(0),
+                count: AtomicIsize::new(0),
+            }
+        }
+    }
 
-//         pub fn assert_no_leaks(&self) {
-//             assert_eq!(self.bytes.load(Ordering::Acquire), 0);
-//             assert_eq!(self.count.load(Ordering::Acquire), 0);
-//         }
-//     }
+    unsafe impl GlobalAlloc for MyAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            unsafe {
+                let ptr = System.alloc(layout);
+                if !ptr.is_null() {
+                    self.bytes
+                        .fetch_add(layout.size() as isize, Ordering::SeqCst);
+                    self.count.fetch_add(1, Ordering::SeqCst);
+                }
+                ptr
+            }
+        }
 
-//     unsafe impl GlobalAlloc for MyAlloc {
-//         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-//             unsafe {
-//                 let ptr = System.alloc(layout);
-//                 if !ptr.is_null() {
-//                     self.bytes
-//                         .fetch_add(layout.size() as isize, Ordering::SeqCst);
-//                     self.count.fetch_add(1, Ordering::SeqCst);
-//                 }
-//                 ptr
-//             }
-//         }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe {
+                System.dealloc(ptr, layout);
+                self.bytes
+                    .fetch_sub(layout.size() as isize, Ordering::SeqCst);
+                self.count.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
 
-//         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-//             unsafe {
-//                 System.dealloc(ptr, layout);
-//                 self.bytes
-//                     .fetch_sub(layout.size() as isize, Ordering::SeqCst);
-//                 self.count.fetch_sub(1, Ordering::SeqCst);
-//             }
-//         }
-//     }
-
-//     #[global_allocator]
-//     pub(crate) static ALLOC: MyAlloc = MyAlloc::new();
-// }
+    #[global_allocator]
+    pub(crate) static ALLOC: MyAlloc = MyAlloc::new();
+}
 
 // #[cfg(test)]
 // pub(crate) mod tests {

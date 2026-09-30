@@ -6,7 +6,7 @@
 //! (in single producer case), without in a mixed mode. Same for [RingBuffer::pop] (used in multiple consumers case)
 //! and [RingBuffer::pop_for_sc] (used in single consumers case).
 //!
-use crate::{CacheAligned, Error, Result};
+use crate::CacheAligned;
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,6 +20,7 @@ struct Cell<T> {
 #[derive(Debug)]
 pub struct RingBuffer<T> {
     buf: Box<[Cell<T>]>,
+    size: usize,
     mask: usize,
     head: CacheAligned<AtomicUsize>,
     tail: CacheAligned<AtomicUsize>,
@@ -30,11 +31,13 @@ unsafe impl<T: Send> Sync for RingBuffer<T> {}
 
 impl<T> RingBuffer<T> {
     /// Create a new ring buffer. The capacity is 2^k, where k is the value of the parameter `size_order`.
-    pub fn new(size_order: u8) -> Result<Self> {
+    pub fn new(size_order: u8) -> crate::Result<Self> {
         let size = 1usize << size_order;
         let max_isize = isize::MAX as usize;
         if size > max_isize {
-            return Err(Error::InvalidArgument("`size_order` is too large".into()));
+            return Err(crate::Error::InvalidArgument(
+                "`size_order` is too large".into(),
+            ));
         }
 
         let mut buf = Vec::with_capacity(size);
@@ -47,6 +50,7 @@ impl<T> RingBuffer<T> {
 
         Ok(Self {
             buf: buf.into_boxed_slice(),
+            size,
             mask: size - 1,
             head: CacheAligned::<AtomicUsize>(AtomicUsize::new(0)),
             tail: CacheAligned::<AtomicUsize>(AtomicUsize::new(0)),
@@ -54,7 +58,7 @@ impl<T> RingBuffer<T> {
     }
 
     /// Push a value into the ring buffer.
-    pub fn push(&self, value: T) -> Result<(&mut T, usize)> {
+    pub fn push(&self, value: T) -> Result<&mut T, T> {
         let mut tail = self.tail.0.load(Ordering::Relaxed);
 
         loop {
@@ -72,14 +76,14 @@ impl<T> RingBuffer<T> {
                     Ok(_) => {
                         let v = unsafe { (*cell.data.get()).write(value) };
                         cell.seq.store(tail + 1, Ordering::Release);
-                        return Ok((v, tail & self.mask));
+                        return Ok(v);
                     }
                     Err(actual) => {
                         tail = actual;
                     }
                 }
             } else if diff < 0 {
-                return Err(Error::RingBufferFull);
+                return Err(value);
             } else {
                 tail = self.tail.0.load(Ordering::Relaxed);
             }
@@ -104,7 +108,7 @@ impl<T> RingBuffer<T> {
                 ) {
                     Ok(_) => {
                         let value = unsafe { (*cell.data.get()).assume_init_read() };
-                        cell.seq.store(head + self.mask + 1, Ordering::Release);
+                        cell.seq.store(head + self.size, Ordering::Release);
                         return Some(value);
                     }
                     Err(actual) => {
@@ -120,7 +124,7 @@ impl<T> RingBuffer<T> {
     }
 
     /// Push a value into the ring buffer (used in single producer case).
-    pub fn push_for_sp(&self, value: T) -> Result<(&mut T, usize)> {
+    pub fn push_for_sp(&self, value: T) -> Result<&mut T, T> {
         let tail = self.tail.0.load(Ordering::Relaxed);
         let cell = &self.buf[tail & self.mask];
         let seq = cell.seq.load(Ordering::Acquire);
@@ -129,9 +133,9 @@ impl<T> RingBuffer<T> {
             let v = unsafe { (*cell.data.get()).write(value) };
             cell.seq.store(tail + 1, Ordering::Release);
             self.tail.0.store(tail + 1, Ordering::Relaxed);
-            Ok((v, tail & self.mask))
+            Ok(v)
         } else {
-            Err(Error::RingBufferFull)
+            Err(value)
         }
     }
 
@@ -143,12 +147,25 @@ impl<T> RingBuffer<T> {
 
         if seq == head + 1 {
             let value = unsafe { (*cell.data.get()).assume_init_read() };
-            cell.seq.store(head + self.mask + 1, Ordering::Release);
+            cell.seq.store(head + self.size, Ordering::Release);
             self.head.0.store(head + 1, Ordering::Relaxed);
             Some(value)
         } else {
             None
         }
+    }
+
+    #[inline]
+    /// Get an approximate nubmer of elements in the ring buffer.
+    pub fn len(&self) -> usize {
+        let tail = self.tail.0.load(Ordering::Acquire);
+        let head = self.head.0.load(Ordering::Acquire);
+        tail.saturating_sub(head).min(self.size)
+    }
+
+    #[inline]
+    pub fn capa(&self) -> usize {
+        self.size
     }
 }
 
@@ -172,9 +189,8 @@ mod tests {
     fn test_basic_fifo() {
         let rb = RingBuffer::<i32>::new(ORDER).unwrap();
 
-        let (val_ref, idx) = rb.push(10).unwrap();
+        let val_ref = rb.push(10).unwrap();
         assert_eq!(*val_ref, 10);
-        assert_eq!(idx, 0);
 
         rb.push(20).unwrap();
 
@@ -301,6 +317,7 @@ mod tests {
         assert_eq!(total_popped, total_items);
     }
 
+    #[derive(Debug)]
     struct DropDetector(Arc<AtomicUsize>);
     impl Drop for DropDetector {
         fn drop(&mut self) {

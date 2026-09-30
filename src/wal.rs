@@ -216,7 +216,7 @@ impl DiskLogEntry {
 
         let recv_crc = src.get_u32_ne();
         let entry_len = u32::from_ne_bytes(src[..4].try_into().unwrap()) as usize;
-        if entry_len as usize > olen - LOG_HEAD_SIZE {
+        if entry_len > olen - LOG_HEAD_SIZE {
             return Self::decode_err("len field is too large");
         }
 
@@ -313,22 +313,12 @@ impl DiskBlockHeader {
     }
 }
 
+#[derive(Default)]
 struct DiskManiEntry {
     _crc: u32,
     _ver: u8,
     _resv: [u8; 3],
     min_lsn: u64,
-}
-
-impl Default for DiskManiEntry {
-    fn default() -> Self {
-        Self {
-            _crc: 0u32,
-            _ver: 0,
-            _resv: [0u8; 3],
-            min_lsn: 0,
-        }
-    }
 }
 
 const MANI_ENTRY_SIZE: usize = std::mem::size_of::<DiskManiEntry>();
@@ -409,26 +399,18 @@ impl TunableConfig {
     }
 
     fn sanitize(&mut self) {
-        self.block_size = if let Some(size) = self.block_size.checked_next_power_of_two() {
-            size
-        } else {
-            256 * 1024
-        };
-        if self.block_size < 4096 {
-            self.block_size = 4096;
-        } else if self.block_size > 256 * 1024 {
-            self.block_size = 256 * 1024;
+        self.block_size = self
+            .block_size
+            .checked_next_power_of_two()
+            .unwrap_or(256 * 1024);
+        self.block_size = self.block_size.clamp(4096, 256 * 1024);
+        if !self.bulk_flush_size.is_multiple_of(self.block_size) {
+            self.bulk_flush_size = self.bulk_flush_size.div_ceil(self.block_size);
         }
-        if self.bulk_flush_size % self.block_size != 0 {
-            self.bulk_flush_size =
-                ((self.bulk_flush_size + self.block_size - 1) / self.block_size) * self.block_size;
-        }
-        self.bulk_flush_size = if let Some(size) = self.bulk_flush_size.checked_next_power_of_two()
-        {
-            size
-        } else {
-            1024 * 1024
-        };
+        self.bulk_flush_size = self
+            .bulk_flush_size
+            .checked_next_power_of_two()
+            .unwrap_or(1024 * 1024);
         if self.bulk_flush_size < self.block_size {
             self.bulk_flush_size = self.block_size;
         } else if self.bulk_flush_size > 1024 * 1024 {

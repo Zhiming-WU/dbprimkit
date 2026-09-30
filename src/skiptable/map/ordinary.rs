@@ -1,5 +1,5 @@
 //! A key-value map based on skip table, with APIs similar to [std::collections::BTreeMap].
-//! It's designed to used in non-concurrent mode and the user needs to use synchronization
+//! It's designed to be used in non-concurrent mode and the user needs to use synchronization
 //! utilities (i.g. locks) to use it in concurrent mode.
 //!
 //! Below is an example.
@@ -45,16 +45,55 @@
 //!     assert_eq!(map.get(&3), None);
 //! }
 //! ```
+use super::MAX_HEIGHT;
 use rand::Rng;
 use rand::rngs::SmallRng;
 use std::alloc::{Layout, alloc, handle_alloc_error};
 use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::marker::PhantomData;
+use std::mem::MaybeUninit;
 use std::ops::{Bound, RangeBounds};
 
 type NodePtr = *mut u8;
-type PrecVec = Vec<(*mut NodePtr, NodePtr)>;
+type HeapPrecVec = Vec<(*mut NodePtr, NodePtr)>;
+
+struct PrecEnt {
+    prec: *mut NodePtr,
+    next: NodePtr,
+}
+struct PrecVec {
+    len: usize,
+    ary: [MaybeUninit<PrecEnt>; MAX_HEIGHT],
+}
+impl PrecVec {
+    fn new() -> Self {
+        Self {
+            len: 0,
+            ary: unsafe { MaybeUninit::uninit().assume_init() },
+        }
+    }
+
+    fn push(&mut self, prec: *mut NodePtr, next: NodePtr) {
+        if self.len < MAX_HEIGHT {
+            self.ary[self.len].write(PrecEnt { prec, next });
+            self.len += 1;
+        }
+    }
+
+    fn as_slice(&self) -> &[PrecEnt] {
+        let uninit_slice = &self.ary[..self.len];
+        unsafe { uninit_slice.assume_init_ref() }
+    }
+
+    fn to_heap_vec(self) -> HeapPrecVec {
+        let mut vec = HeapPrecVec::with_capacity(self.len);
+        for &PrecEnt { prec, next } in self.as_slice() {
+            vec.push((prec, next));
+        }
+        vec
+    }
+}
 
 #[inline]
 fn next_addr_to_ptr(addr: *mut NodePtr) -> NodePtr {
@@ -164,7 +203,7 @@ impl<K, V> Node<K, V> {
         let (node_layout, slice_offset) = Layout::new::<FixedNode<K, V>>()
             .extend(slice_layout)
             .unwrap();
-        let node_ptr = unsafe {
+        unsafe {
             let raw_ptr = alloc(node_layout);
             if raw_ptr.is_null() {
                 handle_alloc_error(node_layout);
@@ -179,8 +218,7 @@ impl<K, V> Node<K, V> {
             let slice_ptr = raw_ptr.add(slice_offset) as *mut usize;
             std::ptr::write_bytes(slice_ptr, 0, height);
             raw_ptr
-        };
-        node_ptr
+        }
     }
 
     fn from_node_ptr(ptr: NodePtr) -> Box<Self> {
@@ -225,9 +263,9 @@ impl<K, V> SkipTableMap<K, V> {
     /// Parameters:
     /// - `max_height`: The maximum height allowed. The allowed range is [0, 32].
     pub fn new(max_height: usize) -> Self {
-        let max_height = max_height.min(32).max(1);
+        let max_height = max_height.clamp(1, MAX_HEIGHT);
         let mut next = Vec::with_capacity(max_height);
-        for _ in 0..max_height as usize {
+        for _ in 0..max_height {
             next.push(std::ptr::null_mut());
         }
         Self {
@@ -239,7 +277,17 @@ impl<K, V> SkipTableMap<K, V> {
         }
     }
 
-    fn like_nodes(vec: &PrecVec, ins_node: NodePtr, height: usize) {
+    fn link_nodes(vec: &PrecVec, ins_node: NodePtr, height: usize) {
+        let mut level = height;
+        let start = vec.len - height;
+        for &PrecEnt { prec, next } in &vec.as_slice()[start..] {
+            level -= 1;
+            set_next(FixedNode::<K, V>::get_next_addr(ins_node, level), next);
+            set_next(prec, ins_node);
+        }
+    }
+
+    fn like_nodes_heap_vec(vec: &HeapPrecVec, ins_node: NodePtr, height: usize) {
         let mut level = height;
         let start = vec.len() - height;
         for &(prec, next) in &vec[start..] {
@@ -255,7 +303,7 @@ impl<K, V> SkipTableMap<K, V> {
         K: Borrow<Q> + Ord,
     {
         let null: NodePtr = std::ptr::null_mut();
-        let mut level = self.max_height as usize - 1;
+        let mut level = self.max_height - 1;
         let mut next: NodePtr = null;
 
         'level_loop: loop {
@@ -301,14 +349,13 @@ impl<K, V> SkipTableMap<K, V> {
         null
     }
 
-    fn search_ext<Q>(&self, key: &Q, prec_height: usize) -> (NodePtr, PrecVec)
+    fn search_ext<Q>(&self, key: &Q, prec_height: usize, vec: &mut PrecVec) -> NodePtr
     where
         Q: Ord + ?Sized,
         K: Borrow<Q> + Ord,
     {
         let null: *mut u8 = std::ptr::null_mut();
-        let mut level = self.max_height as usize - 1;
-        let mut vec = PrecVec::new();
+        let mut level = self.max_height - 1;
         let mut next: NodePtr = null;
         let mut res: NodePtr = null;
 
@@ -322,7 +369,7 @@ impl<K, V> SkipTableMap<K, V> {
             'same_level: loop {
                 if next.is_null() {
                     if level < prec_height {
-                        vec.push((next_addr, next));
+                        vec.push(next_addr, next);
                     }
                     if level == 0 {
                         break 'level_loop;
@@ -338,7 +385,7 @@ impl<K, V> SkipTableMap<K, V> {
                     match k.cmp(key) {
                         Ordering::Equal => {
                             if level < prec_height {
-                                vec.push((next_addr, next));
+                                vec.push(next_addr, next);
                             }
                             if level == 0 {
                                 res = next;
@@ -357,7 +404,7 @@ impl<K, V> SkipTableMap<K, V> {
                         }
                         Ordering::Greater => {
                             if level < prec_height {
-                                vec.push((next_addr, next));
+                                vec.push(next_addr, next);
                             }
                             if level == 0 {
                                 break 'level_loop;
@@ -370,7 +417,7 @@ impl<K, V> SkipTableMap<K, V> {
                 }
             }
         }
-        (res, vec)
+        res
     }
 
     /// Inserts a key-value pair into the map.
@@ -382,20 +429,31 @@ impl<K, V> SkipTableMap<K, V> {
         K: Ord,
     {
         let this_height = self.hgen.gen_height();
-        let sch_res = self.search_ext(&key, this_height);
-        if !sch_res.0.is_null() {
-            let node = FixedNode::<K, V>::ptr_to_mut(sch_res.0);
+        let mut vec = PrecVec::new();
+        let sch_res = self.search_ext(&key, this_height, &mut vec);
+        if !sch_res.is_null() {
+            let node = FixedNode::<K, V>::ptr_to_mut(sch_res);
             std::mem::swap(&mut node.value, &mut value);
             Some(value)
         } else {
             let ins_node = Node::<K, V>::new(key, value, this_height);
-            Self::like_nodes(&sch_res.1, ins_node, this_height);
+            Self::link_nodes(&vec, ins_node, this_height);
             self.len += 1;
             None
         }
     }
 
-    fn unlike_nodes(vec: &Vec<(*mut NodePtr, NodePtr)>, height: usize) {
+    fn unlink_nodes(vec: &PrecVec, height: usize) {
+        let mut level = height;
+        let start = vec.len - height;
+        for &PrecEnt { prec, next } in &vec.as_slice()[start..] {
+            level -= 1;
+            let new_next = next_addr_to_ptr(FixedNode::<K, V>::get_next_addr(next, level));
+            set_next(prec, new_next);
+        }
+    }
+
+    fn unlike_nodes_heap_vec(vec: &HeapPrecVec, height: usize) {
         let mut level = height;
         let start = vec.len() - height;
         for &(prec, next) in &vec[start..] {
@@ -411,10 +469,7 @@ impl<K, V> SkipTableMap<K, V> {
         Q: Ord + ?Sized,
         K: Borrow<Q> + Ord,
     {
-        match self.remove_entry(key) {
-            Some((_, v)) => Some(v),
-            None => None,
-        }
+        self.remove_entry(key).map(|(_, v)| v)
     }
 
     /// Removes a key from the map, returning the stored key and value if the key was previously in the map.
@@ -423,17 +478,18 @@ impl<K, V> SkipTableMap<K, V> {
         Q: Ord + ?Sized,
         K: Borrow<Q> + Ord,
     {
-        let sch_res = self.search_ext(&key, self.max_height);
-        if !sch_res.0.is_null() {
-            let node_box = Node::<K, V>::from_node_ptr(sch_res.0);
-            Self::unlike_nodes(&sch_res.1, node_box.height);
+        let mut vec = PrecVec::new();
+        let sch_res = self.search_ext(key, self.max_height, &mut vec);
+        if !sch_res.is_null() {
+            let node_box = Node::<K, V>::from_node_ptr(sch_res);
+            Self::unlink_nodes(&vec, node_box.height);
             self.len -= 1;
             return Some((node_box.key, node_box.value));
         }
         None
     }
 
-    fn get_node_mut<'a>(&'a self, ptr: NodePtr) -> &'a mut FixedNode<K, V> {
+    fn get_node_mut(&self, ptr: NodePtr) -> &mut FixedNode<K, V> {
         FixedNode::<K, V>::ptr_to_mut(ptr)
     }
 
@@ -479,7 +535,7 @@ impl<K, V> SkipTableMap<K, V> {
         self.len
     }
 
-    /// Returns true if the map contains no elements.
+    /// Returns `true` if the map contains no elements.
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -488,7 +544,7 @@ impl<K, V> SkipTableMap<K, V> {
     pub fn clear(&mut self) {
         let null = std::ptr::null_mut();
         let mut node_ptr = self.next[0];
-        for level in 0..self.max_height as usize {
+        for level in 0..self.max_height {
             let next_addr = self.get_next_addr(level);
             set_next(next_addr, null);
         }
@@ -500,7 +556,7 @@ impl<K, V> SkipTableMap<K, V> {
         self.len = 0;
     }
 
-    /// Returns true if the map contains a value for the specified key.
+    /// Returns `true` if the map contains a value for the specified key.
     pub fn contains_key<Q>(&self, key: &Q) -> bool
     where
         Q: Ord + ?Sized,
@@ -515,18 +571,19 @@ impl<K, V> SkipTableMap<K, V> {
     where
         K: Ord,
     {
-        let sch_res = self.search_ext(&key, self.max_height);
-        if sch_res.0.is_null() {
+        let mut vec = PrecVec::new();
+        let sch_res = self.search_ext(&key, self.max_height, &mut vec);
+        if sch_res.is_null() {
             Entry::Vacant(VacantEntry {
                 map: self,
                 key,
-                vec: sch_res.1,
+                vec: vec.to_heap_vec(),
             })
         } else {
             Entry::Occupied(OccupiedEntry {
                 map: self,
-                ptr: sch_res.0,
-                vec: sch_res.1,
+                ptr: sch_res,
+                vec: vec.to_heap_vec(),
             })
         }
     }
@@ -588,7 +645,7 @@ impl<K, V> SkipTableMap<K, V> {
             return None;
         }
         let node = FixedNode::<K, V>::ptr_to_mut(ptr);
-        let mut vec = PrecVec::with_capacity(node.height);
+        let mut vec = HeapPrecVec::with_capacity(node.height);
         let mut level = node.height;
         while level > 0 {
             level -= 1;
@@ -614,7 +671,7 @@ impl<K, V> SkipTableMap<K, V> {
 
     fn search_last(&self) -> NodePtr {
         let null: *mut u8 = std::ptr::null_mut();
-        let mut level = self.max_height as usize - 1;
+        let mut level = self.max_height - 1;
         let mut next: NodePtr = null;
         let mut res: NodePtr = null;
 
@@ -673,11 +730,12 @@ impl<K, V> SkipTableMap<K, V> {
             return None;
         }
         let node = FixedNode::<K, V>::ptr_to_mut(ptr);
-        let sch_res = self.search_ext(&node.key, node.height);
+        let mut vec = PrecVec::new();
+        let _sch_res = self.search_ext(&node.key, node.height, &mut vec);
         Some(OccupiedEntry {
             map: self,
             ptr,
-            vec: sch_res.1,
+            vec: vec.to_heap_vec(),
         })
     }
 
@@ -695,7 +753,7 @@ impl<K, V> SkipTableMap<K, V> {
         K: Borrow<Q> + Ord,
     {
         let null: *mut u8 = std::ptr::null_mut();
-        let mut level = self.max_height as usize - 1;
+        let mut level = self.max_height - 1;
         let mut next: NodePtr = null;
         let mut res: NodePtr = null;
 
@@ -781,7 +839,7 @@ impl<K, V> SkipTableMap<K, V> {
 pub struct VacantEntry<'a, K, V> {
     map: &'a mut SkipTableMap<K, V>,
     key: K,
-    vec: Vec<(*mut NodePtr, NodePtr)>,
+    vec: HeapPrecVec,
 }
 
 impl<'a, K: Ord, V> VacantEntry<'a, K, V> {
@@ -805,7 +863,7 @@ impl<'a, K: Ord, V> VacantEntry<'a, K, V> {
     pub fn insert_entry(self, value: V) -> OccupiedEntry<'a, K, V> {
         let height = self.map.hgen.gen_height();
         let node = Node::<K, V>::new(self.key, value, height);
-        SkipTableMap::<K, V>::like_nodes(&self.vec, node, height);
+        SkipTableMap::<K, V>::like_nodes_heap_vec(&self.vec, node, height);
         self.map.len += 1;
         OccupiedEntry {
             map: self.map,
@@ -819,7 +877,7 @@ impl<'a, K: Ord, V> VacantEntry<'a, K, V> {
 pub struct OccupiedEntry<'a, K, V> {
     map: &'a mut SkipTableMap<K, V>,
     ptr: NodePtr,
-    vec: Vec<(*mut NodePtr, NodePtr)>,
+    vec: HeapPrecVec,
 }
 
 impl<'a, K, V> OccupiedEntry<'a, K, V> {
@@ -832,7 +890,7 @@ impl<'a, K, V> OccupiedEntry<'a, K, V> {
     /// Take ownership of the key and value from the map.
     pub fn remove_entry(self) -> (K, V) {
         let node = Node::<K, V>::from_node_ptr(self.ptr);
-        SkipTableMap::<K, V>::unlike_nodes(&self.vec, node.height);
+        SkipTableMap::<K, V>::unlike_nodes_heap_vec(&self.vec, node.height);
         self.map.len -= 1;
         (node.key, node.value)
     }
@@ -1104,9 +1162,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::alloc_tests::ALLOC;
     use rand::Rng;
-    //use std::sync::atomic::Ordering;
     use std::{collections::BTreeSet, time::Instant};
 
     #[test]
@@ -1150,9 +1206,11 @@ mod tests {
     #[test]
     #[ignore]
     fn test_perf() {
-        let mut rng: SmallRng = rand::make_rng();
+        // use crate::alloc_tests::ALLOC;
+        // use std::sync::atomic::Ordering;
         // let obytes = ALLOC.bytes.load(Ordering::Acquire);
         // let ocount = ALLOC.count.load(Ordering::Acquire);
+        let mut rng: SmallRng = rand::make_rng();
         {
             let mut table = SkipTableMap::<u64, u64>::new(24);
 

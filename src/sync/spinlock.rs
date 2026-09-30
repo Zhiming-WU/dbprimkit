@@ -37,6 +37,7 @@ const FALSE: usize = 0;
 const TRUE: usize = 1;
 
 /// A simple spin lock implementation.
+#[derive(Debug)]
 pub struct SpinLock<T> {
     locked: AtomicUsize,
     value: UnsafeCell<T>,

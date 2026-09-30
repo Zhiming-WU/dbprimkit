@@ -84,8 +84,8 @@ impl<IO: IoBackend> WalDataRotNameProviderImpl<IO> {
         if tail.len() != 31 || tail.as_bytes()[10] != b'.' {
             return None;
         }
-        let rot_no: u32 = (&tail[..10]).parse().ok()?;
-        let next_lsn: u64 = (&tail[11..]).parse().ok()?;
+        let rot_no: u32 = tail[..10].parse().ok()?;
+        let next_lsn: u64 = tail[11..].parse().ok()?;
         Some((rot_no, next_lsn))
     }
 
@@ -156,14 +156,14 @@ fn restore_lsn_from_data<IO: IoBackend>(
     if file_size < block_size {
         return Err(CorruptFile("The data file is too small".into()));
     }
-    if file_size % block_size != 0 {
+    if !file_size.is_multiple_of(block_size) {
         return Err(CorruptFile(
             "File size is not multiple of block size".into(),
         ));
     }
     let offset = file_size - block_size;
     reader.seek(std::io::SeekFrom::Start(offset))?;
-    let mut buf = BytesMut::zeroed(BLOCK_HEAD_SIZE as usize);
+    let mut buf = BytesMut::zeroed(BLOCK_HEAD_SIZE);
     reader.read_exact(&mut buf)?;
     let header = DiskBlockHeader::decode(&mut buf.freeze())?;
     Ok((header.whole_min_lsn, header.max_lsn))
@@ -211,7 +211,7 @@ fn remove_no_use_rots<IO: IoBackend>(
     let names = data_rnp.list_rot_names()?;
     for (idx, name) in names.iter().enumerate() {
         if idx > 0 {
-            let (_, lsn) = data_rnp.parse_rot_name(&name).unwrap();
+            let (_, lsn) = data_rnp.parse_rot_name(name).unwrap();
             if lsn <= min_lsn {
                 data_rotator.remove_rot(&names[idx - 1])?;
             } else {
@@ -228,8 +228,8 @@ fn open_reader<IO: IoBackend>(
     rot_name: &str,
     block_size: u64,
 ) -> Result<(IO::Reader, u64)> {
-    let (reader, fsize) = rotator.open_read_rot(&rot_name, false)?;
-    if fsize % block_size as u64 != 0 {
+    let (reader, fsize) = rotator.open_read_rot(rot_name, false)?;
+    if fsize % block_size != 0 {
         return Err(CorruptFile(
             "File size is not multiple of block size".into(),
         ));
@@ -249,7 +249,7 @@ fn new_wal_fields<IO: IoBackend>(
 )> {
     let mani_rotator = DefaultRotator::<IO>::new(
         AsRef::<Path>::as_ref(&inst.dir),
-        &format!("{}_walmani.", &inst.name),
+        &format!("{}_walmani.", inst.name),
         super::MAX_MANI_ROT,
         super::MAX_MANI_ROT_SIZE,
     )?;
@@ -257,7 +257,7 @@ fn new_wal_fields<IO: IoBackend>(
     let flush_lsn = Arc::new(AtomicU64::new(0));
     let data_rnp = Arc::new(WalDataRotNameProviderImpl::<IO>::new(
         AsRef::<Path>::as_ref(&inst.dir),
-        &format!("{}_waldata_", &inst.name),
+        &format!("{}_waldata_", inst.name),
         flush_lsn.clone(),
     ));
 
