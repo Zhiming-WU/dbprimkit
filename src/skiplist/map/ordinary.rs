@@ -1,13 +1,13 @@
-//! A key-value map based on skip table, with APIs similar to [std::collections::BTreeMap].
+//! A key-value map based on skip list, with APIs similar to [std::collections::BTreeMap].
 //! It's designed to be used in non-concurrent mode and the user needs to use synchronization
 //! utilities (i.g. locks) to use it in concurrent mode.
 //!
 //! Below is an example.
 //! ```rust
-//! use dbprimkit::skiptable::map::ordinary::SkipTableMap;
+//! use dbprimkit::skiplist::map::ordinary::SkipListMap;
 //!
 //! fn main() {
-//!     let mut map = SkipTableMap::<i32, String>::new(16);
+//!     let mut map = SkipListMap::<i32, String>::new(16);
 //!
 //!     assert!(map.is_empty());
 //!     assert_eq!(map.len(), 0);
@@ -105,10 +105,8 @@ fn set_next(next_addr: *mut NodePtr, next: NodePtr) {
     unsafe { *next_addr = next }
 }
 
-/// A key-value map based on skip table.
-#[derive(Debug)]
-#[repr(C)]
-pub struct SkipTableMap<K, V> {
+/// A key-value map based on skip list.
+pub struct SkipListMap<K, V> {
     max_height: usize,
     len: usize,
     hgen: HeightGen,
@@ -116,20 +114,16 @@ pub struct SkipTableMap<K, V> {
     _m: PhantomData<(K, V)>,
 }
 
-unsafe impl<K: Send, V: Send> Send for SkipTableMap<K, V> {}
-unsafe impl<K: Sync, V: Sync> Sync for SkipTableMap<K, V> {}
+unsafe impl<K: Send, V: Send> Send for SkipListMap<K, V> {}
+unsafe impl<K: Sync, V: Sync> Sync for SkipListMap<K, V> {}
 
-#[derive(Debug)]
-#[repr(C)]
 struct Node<K, V> {
     height: usize,
     key: K,
     value: V,
-    next: [NodePtr],
+    _next: [NodePtr],
 }
 
-#[derive(Debug)]
-#[repr(C)]
 struct FixedNode<K, V> {
     height: usize,
     key: K,
@@ -228,7 +222,6 @@ impl<K, V> Node<K, V> {
     }
 }
 
-#[derive(Debug)]
 struct HeightGen {
     max_height: usize,
     rng: SmallRng,
@@ -247,21 +240,21 @@ impl HeightGen {
     }
 }
 
-impl<K, V> Drop for SkipTableMap<K, V> {
+impl<K, V> Drop for SkipListMap<K, V> {
     fn drop(&mut self) {
         self.clear();
     }
 }
 
-impl<K, V> SkipTableMap<K, V> {
+impl<K, V> SkipListMap<K, V> {
     fn get_next_addr(&self, level: usize) -> *mut NodePtr {
         &self.next[level] as *const NodePtr as *mut NodePtr
     }
 
-    /// Makes a new, empty [SkipTableMap].
+    /// Makes a new, empty [SkipListMap].
     ///
     /// Parameters:
-    /// - `max_height`: The maximum height allowed. The allowed range is [0, 32].
+    /// - `max_height`: The maximum height allowed. The allowed range is [1, 32].
     pub fn new(max_height: usize) -> Self {
         let max_height = max_height.clamp(1, MAX_HEIGHT);
         let mut next = Vec::with_capacity(max_height);
@@ -835,9 +828,9 @@ impl<K, V> SkipTableMap<K, V> {
     }
 }
 
-/// A view into a vacant entry in a [SkipTableMap]. It is part of the [Entry] enum.
+/// A view into a vacant entry in a [SkipListMap]. It is part of the [Entry] enum.
 pub struct VacantEntry<'a, K, V> {
-    map: &'a mut SkipTableMap<K, V>,
+    map: &'a mut SkipListMap<K, V>,
     key: K,
     vec: HeapPrecVec,
 }
@@ -863,7 +856,7 @@ impl<'a, K: Ord, V> VacantEntry<'a, K, V> {
     pub fn insert_entry(self, value: V) -> OccupiedEntry<'a, K, V> {
         let height = self.map.hgen.gen_height();
         let node = Node::<K, V>::new(self.key, value, height);
-        SkipTableMap::<K, V>::like_nodes_heap_vec(&self.vec, node, height);
+        SkipListMap::<K, V>::like_nodes_heap_vec(&self.vec, node, height);
         self.map.len += 1;
         OccupiedEntry {
             map: self.map,
@@ -873,9 +866,9 @@ impl<'a, K: Ord, V> VacantEntry<'a, K, V> {
     }
 }
 
-/// A view into an occupied entry in a [SkipTableMap]. It is part of the [Entry] enum.
+/// A view into an occupied entry in a [SkipListMap]. It is part of the [Entry] enum.
 pub struct OccupiedEntry<'a, K, V> {
-    map: &'a mut SkipTableMap<K, V>,
+    map: &'a mut SkipListMap<K, V>,
     ptr: NodePtr,
     vec: HeapPrecVec,
 }
@@ -890,7 +883,7 @@ impl<'a, K, V> OccupiedEntry<'a, K, V> {
     /// Take ownership of the key and value from the map.
     pub fn remove_entry(self) -> (K, V) {
         let node = Node::<K, V>::from_node_ptr(self.ptr);
-        SkipTableMap::<K, V>::unlike_nodes_heap_vec(&self.vec, node.height);
+        SkipListMap::<K, V>::unlike_nodes_heap_vec(&self.vec, node.height);
         self.map.len -= 1;
         (node.key, node.value)
     }
@@ -927,7 +920,7 @@ impl<'a, K, V> OccupiedEntry<'a, K, V> {
 }
 
 /// A view into a single entry in a map, which may either be vacant or occupied.
-/// This struct is created by [SkipTableMap::entry].
+/// This struct is created by [SkipListMap::entry].
 pub enum Entry<'a, K, V> {
     /// A vacant entry.
     Vacant(VacantEntry<'a, K, V>),
@@ -1016,8 +1009,8 @@ impl<'a, K: Ord, V: Default> Entry<'a, K, V> {
     }
 }
 
-/// An iterator over the keys of a [SkipTableMap].
-/// This struct is created by [SkipTableMap::keys].
+/// An iterator over the keys of a [SkipListMap].
+/// This struct is created by [SkipListMap::keys].
 pub struct Keys<'a, K, V> {
     inner: Iter<'a, K, V>,
 }
@@ -1029,8 +1022,8 @@ impl<'a, K, V> Iterator for Keys<'a, K, V> {
     }
 }
 
-/// An iterator over the values of a [SkipTableMap].
-/// This struct is created by [SkipTableMap::values].
+/// An iterator over the values of a [SkipListMap].
+/// This struct is created by [SkipListMap::values].
 pub struct Values<'a, K, V> {
     inner: Iter<'a, K, V>,
 }
@@ -1042,8 +1035,8 @@ impl<'a, K, V> Iterator for Values<'a, K, V> {
     }
 }
 
-/// A mutable iterator over the values of a [SkipTableMap].
-/// This struct is created by [SkipTableMap::values_mut].
+/// A mutable iterator over the values of a [SkipListMap].
+/// This struct is created by [SkipListMap::values_mut].
 pub struct ValuesMut<'a, K, V> {
     inner: IterMut<'a, K, V>,
 }
@@ -1055,8 +1048,8 @@ impl<'a, K, V> Iterator for ValuesMut<'a, K, V> {
     }
 }
 
-/// An iterator over the entries of a [SkipTableMap].
-/// This struct is created by [SkipTableMap::iter].
+/// An iterator over the entries of a [SkipListMap].
+/// This struct is created by [SkipListMap::iter].
 pub struct Iter<'a, K: 'a, V: 'a> {
     _m: PhantomData<&'a (K, V)>,
     ptr: NodePtr,
@@ -1074,8 +1067,8 @@ impl<'a, K: 'a, V: 'a> Iterator for Iter<'a, K, V> {
     }
 }
 
-/// A mutable iterator over the entries of a [SkipTableMap].
-/// This struct is created by [SkipTableMap::iter_mut].
+/// A mutable iterator over the entries of a [SkipListMap].
+/// This struct is created by [SkipListMap::iter_mut].
 pub struct IterMut<'a, K: 'a, V: 'a> {
     _m: PhantomData<&'a (K, V)>,
     ptr: NodePtr,
@@ -1093,8 +1086,8 @@ impl<'a, K: 'a, V: 'a> Iterator for IterMut<'a, K, V> {
     }
 }
 
-/// An iterator over a sub-range of entries in a [SkipTableMap].
-/// This struct is created by [SkipTableMap::range].
+/// An iterator over a sub-range of entries in a [SkipListMap].
+/// This struct is created by [SkipListMap::range].
 pub struct Range<'a, K: 'a, V: 'a, Q, R>
 where
     Q: Ord + ?Sized,
@@ -1126,8 +1119,8 @@ where
     }
 }
 
-/// A mutable iterator over a sub-range of entries in a [SkipTableMap].
-/// This struct is created by [SkipTableMap::range_mut].
+/// A mutable iterator over a sub-range of entries in a [SkipListMap].
+/// This struct is created by [SkipListMap::range_mut].
 pub struct RangeMut<'a, K: 'a, V: 'a, Q, R>
 where
     Q: Ord + ?Sized,
@@ -1167,7 +1160,7 @@ mod tests {
 
     #[test]
     fn test_check_nodes() {
-        let mut table = SkipTableMap::<u64, u64>::new(3);
+        let mut map = SkipListMap::<u64, u64>::new(3);
         let mut rng: SmallRng = rand::make_rng();
 
         let max = 32usize;
@@ -1181,24 +1174,28 @@ mod tests {
 
         for idx in 0..max {
             let num = vec[idx];
-            table.insert(num, num + 10);
+            map.insert(num, num + 10);
         }
 
-        println!("table={:?}", table);
-        let mut next = table.next[0];
+        println!("map={:?}", map.next);
+        let mut next = map.next[0];
         while !next.is_null() {
             let node = Node::<u64, u64>::from_node_ptr(next);
-            println!("node, ptr={:?}, node={:?}", next, node);
-            next = node.next[0];
+
+            println!(
+                "node, ptr={:?}, node=(height={}, key={}, val={}, next={:?})",
+                next, node.height, node.key, node.value, &node._next
+            );
+            next = node._next[0];
             let _ = Box::into_raw(node);
         }
 
         for num in &vec {
-            let v = table.get(num).unwrap();
+            let v = map.get(num).unwrap();
             assert_eq!(*v, *num + 10);
         }
         for num in &vec {
-            let v = table.remove(num).unwrap();
+            let v = map.remove(num).unwrap();
             assert_eq!(v, *num + 10);
         }
     }
@@ -1212,7 +1209,7 @@ mod tests {
         // let ocount = ALLOC.count.load(Ordering::Acquire);
         let mut rng: SmallRng = rand::make_rng();
         {
-            let mut table = SkipTableMap::<u64, u64>::new(24);
+            let mut map = SkipListMap::<u64, u64>::new(24);
 
             let max = 2usize.pow(24);
             let mut vec = Vec::<u64>::with_capacity(max);
@@ -1231,32 +1228,32 @@ mod tests {
             let start_time = Instant::now();
             for idx in 0..max {
                 let num = vec[idx];
-                table.insert(num, num + 10);
+                map.insert(num, num + 10);
             }
-            println!("wduration={:?}, len={}", start_time.elapsed(), table.len());
+            println!("wduration={:?}, len={}", start_time.elapsed(), map.len());
             let last = u64::MAX;
-            let mut next = table.next[0];
+            let mut next = map.next[0];
             while !next.is_null() {
                 let node = Node::<u64, u64>::from_node_ptr(next);
                 if last != u64::MAX {
                     assert!(last < node.key);
                 }
-                next = node.next[0];
+                next = node._next[0];
                 let _ = Box::into_raw(node);
             }
             let start_time = Instant::now();
             for num in &vec {
-                let v = table.get(num).unwrap();
+                let v = map.get(num).unwrap();
                 assert_eq!(*v, *num + 10);
             }
             println!("rduration={:?}", start_time.elapsed());
             let start_time = Instant::now();
             for num in &vec {
-                let v = table.remove(num).unwrap();
+                let v = map.remove(num).unwrap();
                 assert_eq!(v, *num + 10);
             }
-            println!("dduration={:?}, len={}", start_time.elapsed(), table.len());
-            assert!(table.is_empty());
+            println!("dduration={:?}, len={}", start_time.elapsed(), map.len());
+            assert!(map.is_empty());
         }
         // let nbytes = ALLOC.bytes.load(Ordering::Acquire);
         // let ncount = ALLOC.count.load(Ordering::Acquire);
@@ -1270,7 +1267,7 @@ mod tests {
 
     #[test]
     fn test_basic_crud() {
-        let mut map = SkipTableMap::<i32, String>::new(16);
+        let mut map = SkipListMap::<i32, String>::new(16);
 
         assert!(map.is_empty());
         assert_eq!(map.len(), 0);
@@ -1310,7 +1307,7 @@ mod tests {
 
     #[test]
     fn test_entry_api() {
-        let mut map = SkipTableMap::<&str, i32>::new(8);
+        let mut map = SkipListMap::<&str, i32>::new(8);
 
         map.entry("a").or_insert(100);
         assert_eq!(map.get("a"), Some(&100));
@@ -1336,7 +1333,7 @@ mod tests {
 
     #[test]
     fn test_first_and_last_operations() {
-        let mut map = SkipTableMap::<i32, i32>::new(16);
+        let mut map = SkipListMap::<i32, i32>::new(16);
 
         assert_eq!(map.first_key_value(), None);
         assert_eq!(map.last_key_value(), None);
@@ -1362,7 +1359,7 @@ mod tests {
 
     #[test]
     fn test_iterators() {
-        let mut map = SkipTableMap::<i32, i32>::new(8);
+        let mut map = SkipListMap::<i32, i32>::new(8);
         map.insert(3, 30);
         map.insert(1, 10);
         map.insert(2, 20);
@@ -1386,7 +1383,7 @@ mod tests {
 
     #[test]
     fn test_range() {
-        let mut map = SkipTableMap::<i32, i32>::new(16);
+        let mut map = SkipListMap::<i32, i32>::new(16);
         for i in (1..=10).rev() {
             map.insert(i, i * 10);
         }
@@ -1427,7 +1424,7 @@ mod tests {
         let dropped2 = AtomicBool::new(false);
 
         {
-            let mut map = SkipTableMap::<i32, DropChecker>::new(4);
+            let mut map = SkipListMap::<i32, DropChecker>::new(4);
             map.insert(1, DropChecker(&dropped1));
             map.insert(2, DropChecker(&dropped2));
             map.remove(&1);
@@ -1443,7 +1440,7 @@ mod tests {
         use std::sync::{Arc, RwLock};
         use std::thread;
 
-        let map = Arc::new(RwLock::new(SkipTableMap::<i32, String>::new(16)));
+        let map = Arc::new(RwLock::new(SkipListMap::<i32, String>::new(16)));
         let mut handles = vec![];
 
         {
@@ -1495,7 +1492,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
         use std::thread;
 
-        let map = Arc::new(Mutex::new(SkipTableMap::<i32, i32>::new(16)));
+        let map = Arc::new(Mutex::new(SkipListMap::<i32, i32>::new(16)));
         let mut handles = vec![];
 
         for t in 0..10 {

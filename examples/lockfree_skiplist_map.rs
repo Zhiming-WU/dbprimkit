@@ -1,10 +1,10 @@
-use dbprimkit::skiptable::map::lockfree::SkipTableMap;
+use dbprimkit::skiplist::map::lockfree::SkipListMap;
 use rand::Rng;
 use rand::rngs::SmallRng;
 
 fn main() {
     let order = 12usize;
-    let table = SkipTableMap::<u64, u64>::new(order, None);
+    let table = SkipListMap::<u64, u64>::new(order, None);
     let mut rng: SmallRng = rand::make_rng();
 
     let max = 2usize.pow(order as u32);

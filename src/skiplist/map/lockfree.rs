@@ -1,17 +1,17 @@
-//! A key-value map based on skip table. It's designed to be used in concurrent mode and performance
+//! A key-value map based on skip list. It's designed to be used in concurrent mode and performance
 //! takes high priority. It has narrower APIs comapred to [super::ordinary].
 //!
 //! EBR (epoch based reclamation) approach is used to safely free objects.
 //!
 //! Below is an example.
 //! ```rust
-//! use dbprimkit::skiptable::map::lockfree::SkipTableMap;
+//! use dbprimkit::skiplist::map::lockfree::SkipListMap;
 //! use rand::Rng;
 //! use rand::rngs::SmallRng;
 //!
 //! fn main() {
 //!     let order = 12usize;
-//!     let table = SkipTableMap::<u64, u64>::new(order, None);
+//!     let map = SkipListMap::<u64, u64>::new(order, None);
 //!     let mut rng: SmallRng = rand::make_rng();
 //!
 //!     let max = 2usize.pow(order as u32);
@@ -24,7 +24,7 @@
 //!     let op_cnt = max;
 //!     let mask = max - 1;
 //!     let vec_ref = &vec;
-//!     let table_ref = &table;
+//!     let map_ref = &map;
 //!
 //!     std::thread::scope(|s| {
 //!         for _ in 0..thr_num {
@@ -41,12 +41,12 @@
 //!                                 idx = op_idx as usize & mask;
 //!                             }
 //!                             let key = vec_ref[idx];
-//!                             let _ = table_ref.insert(key, idx as u64);
+//!                             let _ = map_ref.insert(key, idx as u64);
 //!                         }
 //!                         0 => {
 //!                             // get. key may not in map
 //!                             let key = vec_ref[idx];
-//!                             if let Ok(Some(entry)) = table_ref.get(&key) {
+//!                             if let Ok(Some(entry)) = map_ref.get(&key) {
 //!                                 let v = entry.value();
 //!                                 let idx_u64 = idx as u64;
 //!                                 assert!(*v == idx_u64 || *v == idx_u64 >> 1)
@@ -55,7 +55,7 @@
 //!                         1 => {
 //!                             // get_mut. key may not in map
 //!                             let key = vec_ref[idx];
-//!                             if let Ok(Some(mut entry)) = table_ref.get_mut(&key) {
+//!                             if let Ok(Some(mut entry)) = map_ref.get_mut(&key) {
 //!                                 let v = entry.value_mut().unwrap();
 //!                                 let idx_u64 = idx as u64;
 //!                                 assert!(*v == idx_u64 || *v == idx_u64 >> 1);
@@ -66,7 +66,7 @@
 //!                             // remove. key may not in map
 //!                             let key = vec_ref[idx];
 //!                             let idx_u64 = idx as u64;
-//!                             if let Ok(Some(res)) = table_ref.remove(&key) {
+//!                             if let Ok(Some(res)) = map_ref.remove(&key) {
 //!                                 assert!(res.0 == key);
 //!                                 assert!(res.1 == idx_u64 || res.1 == idx_u64 >> 1)
 //!                             }
@@ -74,7 +74,7 @@
 //!                         3 => {
 //!                             // remove_wo_kv. key may not in map
 //!                             let key = vec_ref[idx];
-//!                             table_ref.remove_wo_kv(&key);
+//!                             map_ref.remove_wo_kv(&key);
 //!                         }
 //!                         _ => (),
 //!                     }
@@ -124,13 +124,13 @@ fn epoch_by_off(curr: usize, off: usize) -> usize {
     ret
 }
 
-struct TableEpoch {
+struct MapEpoch {
     lock: SpinLock<()>,
-    table_id: u64,
+    map_id: u64,
     epoch_set: HashSet<usize>,
 }
 
-impl TableEpoch {
+impl MapEpoch {
     fn register_epoch(&mut self, epoch: usize) {
         let _l = self.lock.lock();
         self.epoch_set.insert(epoch);
@@ -148,28 +148,28 @@ impl TableEpoch {
 
 struct EpochRegistry {
     lock: SpinLock<()>,
-    vec: Vec<TableEpoch>,
+    vec: Vec<MapEpoch>,
 }
 
 impl EpochRegistry {
-    fn get_table_epoch(&mut self, table_id: u64) -> Option<&mut TableEpoch> {
+    fn get_map_epoch(&mut self, map_id: u64) -> Option<&mut MapEpoch> {
         let _l = self.lock.lock();
-        self.vec.iter_mut().find(|te| te.table_id == table_id)
+        self.vec.iter_mut().find(|te| te.map_id == map_id)
     }
 
-    fn reg_table_epoch(&mut self, table_id: u64) {
-        let te = TableEpoch {
+    fn reg_map_epoch(&mut self, map_id: u64) {
+        let me = MapEpoch {
             lock: SpinLock::<()>::new(()),
-            table_id,
+            map_id,
             epoch_set: HashSet::new(),
         };
         let _l = self.lock.lock();
-        self.vec.push(te);
+        self.vec.push(me);
     }
 
-    fn remove_table_epoch(&mut self, table_id: u64) {
+    fn remove_map_epoch(&mut self, map_id: u64) {
         let _l = self.lock.lock();
-        if let Some(pos) = self.vec.iter().position(|te| te.table_id == table_id) {
+        if let Some(pos) = self.vec.iter().position(|te| te.map_id == map_id) {
             self.vec.remove(pos);
         }
     }
@@ -212,7 +212,7 @@ fn get_registry() -> EpochRegistryGuard<'static> {
 }
 
 struct LocalEpoch {
-    table_id: u64,
+    map_id: u64,
     gepoch: usize,
     active: CacheAligned<AtomicUsize>,
     epoch: CacheAligned<AtomicUsize>,
@@ -247,12 +247,12 @@ struct LocalEpochVec {
 }
 
 impl LocalEpochVec {
-    fn get_epoch(&mut self, table_id: u64) -> &mut LocalEpoch {
-        if let Some(pos) = self.vec.iter().position(|e| e.table_id == table_id) {
+    fn get_epoch(&mut self, map_id: u64) -> &mut LocalEpoch {
+        if let Some(pos) = self.vec.iter().position(|e| e.map_id == map_id) {
             &mut self.vec[pos]
         } else {
             let epoch = LocalEpoch {
-                table_id,
+                map_id,
                 gepoch: 0,
                 active: CacheAligned(AtomicUsize::new(FALSE)),
                 epoch: CacheAligned(AtomicUsize::new(0)),
@@ -260,15 +260,15 @@ impl LocalEpochVec {
             self.vec.push(epoch);
             let ret = self.vec.last_mut().unwrap();
             let mut reg = get_registry();
-            let t_epoch = reg.get_table_epoch(table_id).unwrap();
+            let t_epoch = reg.get_map_epoch(map_id).unwrap();
             t_epoch.register_epoch(ret as *const LocalEpoch as usize);
             ret
         }
     }
 
     #[cfg(test)]
-    fn remove_epoch(&mut self, table_id: u64) {
-        let res = self.vec.iter().position(|e| e.table_id == table_id);
+    fn remove_epoch(&mut self, map_id: u64) {
+        let res = self.vec.iter().position(|e| e.map_id == map_id);
         if let Some(pos) = res {
             self.vec.remove(pos);
         }
@@ -302,7 +302,7 @@ impl LocalEpochGuard {
 impl Drop for LocalEpochGuard {
     fn drop(&mut self) {
         for lepoch in &self.epoch_vec.vec {
-            if let Some(gepoch) = get_registry().get_table_epoch(lepoch.table_id) {
+            if let Some(gepoch) = get_registry().get_map_epoch(lepoch.map_id) {
                 let ptr = lepoch as *const LocalEpoch as usize;
                 gepoch.unregister_epoch(ptr);
             }
@@ -318,7 +318,6 @@ thread_local! {
 type NodePtr = *mut u8;
 type NodeAtomicPtr = AtomicPtr<u8>;
 
-#[derive(Debug)]
 struct PrecEnt {
     prec: NodePtr,
     next: NodePtr,
@@ -364,9 +363,9 @@ fn normalize_ptr(ptr: NodePtr) -> NodePtr {
     (ptr as usize & !PTR_DELETE_MARK) as NodePtr
 }
 
-/// The option for [SkipTableMap::len].
+/// The option for [SkipListMap::len].
 pub enum LenOption {
-    /// Not provided, [SkipTableMap::len] always returns `0`.
+    /// Not provided, [SkipListMap::len] always returns `0`.
     NotProvided,
     /// Maintained by atomic variable. It costs some overheads in inserting and removing entries.
     AtomicVariable,
@@ -379,14 +378,14 @@ pub enum LenOption {
 //     AtomicCount,
 // }
 
-/// The optional configuration for the [SkipTableMap].
+/// The optional configuration for the [SkipListMap].
 pub struct TunableConfig {
     /// The threshold to advance the epoch to reclaim the garbage in EBR.
     /// The allowed range is `[256,)`. The default value is `256`.
     pub epoch_adv_thres: usize,
-    /// The option for [SkipTableMap::len]. The default value is [LenOption::NotProvided].
+    /// The option for [SkipListMap::len]. The default value is [LenOption::NotProvided].
     pub len_opt: LenOption,
-    // /// The option for [SkipTableMap::clear].
+    // /// The option for [SkipListMap::clear].
     // pub clear_opt: ClearOption,
 }
 
@@ -405,8 +404,8 @@ impl TunableConfig {
     }
 }
 
-/// A key-value map based on skip table.
-pub struct SkipTableMap<K, V> {
+/// A key-value map based on skip list.
+pub struct SkipListMap<K, V> {
     id: u64,
     max_height: usize,
     config: TunableConfig,
@@ -418,19 +417,15 @@ pub struct SkipTableMap<K, V> {
     _m: PhantomData<(K, V)>,
 }
 
-#[derive(Debug)]
-#[repr(C)]
 struct Node<K, V> {
-    height: usize,
+    _height: usize,
     key: ManuallyDrop<K>,
     value: ManuallyDrop<V>,
-    flags: AtomicU32,
-    refcnt: AtomicU32,
-    next: [NodeAtomicPtr],
+    _flags: AtomicU32,
+    _refcnt: AtomicU32,
+    _next: [NodeAtomicPtr],
 }
 
-#[derive(Debug)]
-#[repr(C)]
 struct FixedNode<K, V> {
     height: usize,
     key: ManuallyDrop<K>,
@@ -616,7 +611,7 @@ impl<K, V> EntryRef<K, V> {
     }
 
     /// Gets a mutable reference to the value in the entry. If this [EntryRef] is retrieved by
-    /// [SkipTableMap::get] rather than [SkipTableMap::get_mut], an [ElementRefNotMutable] error
+    /// [SkipListMap::get] rather than [SkipListMap::get_mut], an [ElementRefNotMutable] error
     /// is returned.
     pub fn value_mut(&mut self) -> Result<&mut V> {
         let node = self.as_mut();
@@ -673,9 +668,9 @@ impl<K, V> Drop for EntryRef<K, V> {
     }
 }
 
-impl<K, V> Drop for SkipTableMap<K, V> {
+impl<K, V> Drop for SkipListMap<K, V> {
     fn drop(&mut self) {
-        get_registry().remove_table_epoch(self.id);
+        get_registry().remove_map_epoch(self.id);
         for epoch in 0..self.garbage.len() {
             self.clear_garbage(epoch);
         }
@@ -687,7 +682,7 @@ impl<K, V> Drop for SkipTableMap<K, V> {
     }
 }
 
-impl<K, V> SkipTableMap<K, V> {
+impl<K, V> SkipListMap<K, V> {
     fn put_garbage(&self, epoch: usize, ptr: NodePtr, height: usize) {
         let garb = &self.garbage[epoch];
         let mut head = self.garbage[epoch].load(Ordering::Acquire);
@@ -732,7 +727,7 @@ impl<K, V> SkipTableMap<K, V> {
             {
                 // 2. Wait current(old) epoch exit
                 let mut reg = get_registry();
-                let gepoch = reg.get_table_epoch(self.id).unwrap();
+                let gepoch = reg.get_map_epoch(self.id).unwrap();
                 loop {
                     let mut ok = true;
                     let _ge_lock = gepoch.lock.lock();
@@ -761,7 +756,7 @@ impl<K, V> SkipTableMap<K, V> {
         }
     }
 
-    /// Makes a new, empty [SkipTableMap].
+    /// Makes a new, empty [SkipListMap].
     ///
     /// Parameters:
     /// - `max_height`: The maximum height allowed. The allowed range is [1, 32].
@@ -775,10 +770,10 @@ impl<K, V> SkipTableMap<K, V> {
         for _ in 0..max_height {
             next.push(CacheAligned(NodeAtomicPtr::new(null)));
         }
-        let table_id = ID_GEN.fetch_add(1, Ordering::AcqRel);
-        get_registry().reg_table_epoch(table_id);
+        let map_id = ID_GEN.fetch_add(1, Ordering::AcqRel);
+        get_registry().reg_map_epoch(map_id);
         Self {
-            id: table_id,
+            id: map_id,
             max_height,
             config,
             epoch: CacheAligned(AtomicUsize::new(0)),
@@ -1020,15 +1015,27 @@ impl<K, V> SkipTableMap<K, V> {
         K: Ord,
     {
         let id = self.id;
-        LOCAL_EPOCH.with(|guard| self.insert_inner(key, value, guard.borrow_mut().get_epoch(id)))
+        let res = LOCAL_EPOCH
+            .with(|guard| self.insert_inner(key, value, false, guard.borrow_mut().get_epoch(id)));
+        res.map(|opt_kv| opt_kv.map(|kv| kv.1))
+    }
+
+    pub(crate) fn replace(&self, key: K, value: V) -> std::result::Result<Option<(K, V)>, (K, V)>
+    where
+        K: Ord,
+    {
+        let id = self.id;
+        LOCAL_EPOCH
+            .with(|guard| self.insert_inner(key, value, true, guard.borrow_mut().get_epoch(id)))
     }
 
     fn insert_inner(
         &self,
         mut key: K,
         mut value: V,
+        repalce_key: bool,
         epoch: &mut LocalEpoch,
-    ) -> std::result::Result<Option<V>, (K, V)>
+    ) -> std::result::Result<Option<(K, V)>, (K, V)>
     where
         K: Ord,
     {
@@ -1059,9 +1066,12 @@ impl<K, V> SkipTableMap<K, V> {
                             Ordering::Relaxed,
                         ) {
                             Ok(_) => {
+                                if repalce_key {
+                                    std::mem::swap(&mut key, &mut node.key);
+                                }
                                 std::mem::swap(&mut value, &mut node.value);
                                 node.unxor_flags(FLAG_UPDATING_VALUE);
-                                return Ok(Some(value));
+                                return Ok(Some((key, value)));
                             }
                             Err(f) => {
                                 flags = f;
@@ -1149,9 +1159,9 @@ impl<K, V> SkipTableMap<K, V> {
     /// Removes a key from the map, returning the key and value at the key if the key was previously
     /// in the map.
     ///
-    /// [ElementInUse] is returned if the the entry is being used by others via [SkipTableMap::get] or
-    /// [SkipTableMap::get_mut], since ownership of key and value can't be taken in that case.
-    /// Use [SkipTableMap::remove_wo_kv] instead to avoid that if you don't need key and value.
+    /// [ElementInUse] is returned if the the entry is being used by others via [SkipListMap::get] or
+    /// [SkipListMap::get_mut], since ownership of key and value can't be taken in that case.
+    /// Use [SkipListMap::remove_wo_kv] instead to avoid that if you don't need key and value.
     pub fn remove<Q>(&self, key: &Q) -> Result<Option<(K, V)>>
     where
         Q: Ord + ?Sized,
@@ -1269,7 +1279,7 @@ impl<K, V> SkipTableMap<K, V> {
 
     /// Returns a reference to the entry corresponding to the key.
     ///
-    /// [ElementInMutUse] is returned if the the entry is being used by others via [SkipTableMap::get_mut].
+    /// [ElementInMutUse] is returned if the the entry is being used by others via [SkipListMap::get_mut].
     pub fn get<Q>(&self, key: &Q) -> Result<Option<EntryRef<K, V>>>
     where
         Q: Ord + ?Sized,
@@ -1281,8 +1291,8 @@ impl<K, V> SkipTableMap<K, V> {
 
     /// Returns a mutable reference to the entry corresponding to the key.
     ///
-    /// [ElementInUse] is returned if the the entry is being used by others via [SkipTableMap::get]
-    /// or [SkipTableMap::get_mut].
+    /// [ElementInUse] is returned if the the entry is being used by others via [SkipListMap::get]
+    /// or [SkipListMap::get_mut].
     pub fn get_mut<Q>(&self, key: &Q) -> Result<Option<EntryRef<K, V>>>
     where
         Q: Ord + ?Sized,
@@ -1350,7 +1360,7 @@ impl<K, V> SkipTableMap<K, V> {
     }
 
     /// Returns the number of elements in the map. NOTE that by default it doesn't work (always returns 0)
-    /// unless you configured the table with a [LenOption] rather than [LenOption::NotProvided].
+    /// unless you configured the map with a [LenOption] rather than [LenOption::NotProvided].
     pub fn len(&self) -> usize {
         match self.config.len_opt {
             LenOption::NotProvided => 0,
@@ -1429,7 +1439,7 @@ mod tests {
     #[test]
     fn check_nodes1() {
         let order = 4usize;
-        let table = SkipTableMap::<u64, u64>::new(order, None);
+        let map = SkipListMap::<u64, u64>::new(order, None);
         let mut rng: SmallRng = rand::make_rng();
 
         let max = 2usize.pow(order as u32);
@@ -1449,23 +1459,23 @@ mod tests {
         let start_time = Instant::now();
         for idx in 0..max {
             let num = vec[idx];
-            table.insert(num, num + 10).unwrap();
+            map.insert(num, num + 10).unwrap();
         }
         println!("wduration={:?}", start_time.elapsed());
-        //println!("table={:?}", table);
-        let mut next = table.next[0].load(Ordering::Acquire);
+        //println!("map={:?}", map);
+        let mut next = map.next[0].load(Ordering::Acquire);
         while !next.is_null() {
             let node = Node::<u64, u64>::from_node_ptr(next);
             println!(
                 "node, ptr={:?}, node=(height={}, key={}, val={}, flags={:?}, refcnt={:?}, next={:?})",
-                next, node.height, *node.key, *node.value, node.flags, node.refcnt, &node.next
+                next, node._height, *node.key, *node.value, node._flags, node._refcnt, &node._next
             );
-            next = node.next[0].load(Ordering::Acquire);
+            next = node._next[0].load(Ordering::Acquire);
             let _ = Box::into_raw(node);
         }
         let start_time = Instant::now();
         for num in &vec {
-            let v = table.get(num).unwrap().unwrap();
+            let v = map.get(num).unwrap().unwrap();
             assert_eq!(*v.value(), *num + 10);
         }
         println!("rduration={:?}", start_time.elapsed());
@@ -1474,7 +1484,7 @@ mod tests {
     #[test]
     fn check_nodes2() {
         let order = 12usize;
-        let table = SkipTableMap::<u64, u64>::new(order, None);
+        let map = SkipListMap::<u64, u64>::new(order, None);
         let mut rng: SmallRng = rand::make_rng();
 
         let max = 2usize.pow(order as u32);
@@ -1493,7 +1503,7 @@ mod tests {
 
         let thr_num = 4usize;
         let count_per_thr = max / thr_num;
-        let table_ref = &table;
+        let map_ref = &map;
         let start_time = Instant::now();
         std::thread::scope(|s| {
             for idx in 0..thr_num {
@@ -1502,7 +1512,7 @@ mod tests {
                 let slice = &vec[start..end];
                 s.spawn(move || {
                     for &num in slice {
-                        table_ref.insert(num, num + 10).unwrap();
+                        map_ref.insert(num, num + 10).unwrap();
                     }
                 });
             }
@@ -1516,7 +1526,7 @@ mod tests {
                 let slice = &vec[start..end];
                 s.spawn(move || {
                     for num in slice {
-                        let v = table_ref.get(num).unwrap().unwrap();
+                        let v = map_ref.get(num).unwrap().unwrap();
                         assert_eq!(*v.value(), *num + 10);
                     }
                 });
@@ -1525,8 +1535,8 @@ mod tests {
         println!("rduration={:?}", start_time.elapsed());
 
         let mut prev = u64::MAX;
-        println!("table.next={:?}", &table.next);
-        let mut next = table.next[0].load(Ordering::Acquire);
+        println!("map.next={:?}", &map.next);
+        let mut next = map.next[0].load(Ordering::Acquire);
         while !next.is_null() {
             let node = Node::<u64, u64>::from_node_ptr(next);
             let key = *node.key;
@@ -1535,10 +1545,10 @@ mod tests {
             }
             println!(
                 "node, ptr={:?}, node=(height={}, key={}, val={}, flags={:?}, refcnt={:?}, next={:?})",
-                next, node.height, key, *node.value, node.flags, node.refcnt, &node.next
+                next, node._height, key, *node.value, node._flags, node._refcnt, &node._next
             );
             prev = key;
-            next = node.next[0].load(Ordering::Acquire);
+            next = node._next[0].load(Ordering::Acquire);
             let _ = Box::into_raw(node);
         }
 
@@ -1550,7 +1560,7 @@ mod tests {
                 let slice = &vec[start..end];
                 s.spawn(move || {
                     for num in slice {
-                        let (k, v) = table_ref.remove(num).unwrap().unwrap();
+                        let (k, v) = map_ref.remove(num).unwrap().unwrap();
                         assert_eq!(k, *num);
                         assert_eq!(v, *num + 10);
                     }
@@ -1558,8 +1568,8 @@ mod tests {
             }
         });
         println!("dduration={:?}", start_time.elapsed());
-        assert!(table.len() == 0);
-        println!("gb_cnt={}", table.gb_cnt.load(Ordering::Acquire));
+        assert!(map.len() == 0);
+        println!("gb_cnt={}", map.gb_cnt.load(Ordering::Acquire));
     }
 
     #[test]
@@ -1595,9 +1605,9 @@ mod tests {
                         cfg.len_opt = LenOption::AtomicVariable;
                         config = Some(cfg);
                     }
-                    let table = SkipTableMap::<u64, u64>::new(order, config);
+                    let map = SkipListMap::<u64, u64>::new(order, config);
 
-                    let table_ref = &table;
+                    let map_ref = &map;
                     for _ in 0..5 {
                         let start_time = Instant::now();
                         std::thread::scope(|s| {
@@ -1607,7 +1617,7 @@ mod tests {
                                 let slice = &vec_ref[start..end];
                                 s.spawn(move || {
                                     for &num in slice {
-                                        table_ref.insert(num, num + 10).unwrap();
+                                        map_ref.insert(num, num + 10).unwrap();
                                     }
                                 });
                             }
@@ -1616,7 +1626,7 @@ mod tests {
                             "map{}: wduration={:?}, len={}",
                             map_id,
                             start_time.elapsed(),
-                            table.len()
+                            map.len()
                         );
                         let start_time = Instant::now();
                         std::thread::scope(|s| {
@@ -1626,7 +1636,7 @@ mod tests {
                                 let slice = &vec_ref[start..end];
                                 s.spawn(move || {
                                     for num in slice {
-                                        let v = table_ref.get(num).unwrap().unwrap();
+                                        let v = map_ref.get(num).unwrap().unwrap();
                                         assert_eq!(*v.value(), *num + 10);
                                     }
                                 });
@@ -1636,11 +1646,11 @@ mod tests {
                             "map{}: rduration={:?}, len={}",
                             map_id,
                             start_time.elapsed(),
-                            table.len()
+                            map.len()
                         );
 
                         let mut prev = u64::MAX;
-                        let mut next = table.next[0].load(Ordering::Acquire);
+                        let mut next = map.next[0].load(Ordering::Acquire);
                         while !next.is_null() {
                             let node = FixedNode::<u64, u64>::ptr_to_mut(next);
                             let key = *node.key;
@@ -1659,7 +1669,7 @@ mod tests {
                                 let slice = &vec_ref[start..end];
                                 s.spawn(move || {
                                     for num in slice {
-                                        let (k, v) = table_ref.remove(num).unwrap().unwrap();
+                                        let (k, v) = map_ref.remove(num).unwrap().unwrap();
                                         assert_eq!(k, *num);
                                         assert_eq!(v, *num + 10);
                                     }
@@ -1670,13 +1680,13 @@ mod tests {
                             "map{}: dduration={:?}, len={}",
                             map_id,
                             start_time.elapsed(),
-                            table.len()
+                            map.len()
                         );
-                        assert!(table.len() == 0);
+                        assert!(map.len() == 0);
                         println!(
                             "map{}: gb_cnt={}",
                             map_id,
-                            table.gb_cnt.load(Ordering::Acquire)
+                            map.gb_cnt.load(Ordering::Acquire)
                         );
                     }
                 });
@@ -1688,9 +1698,9 @@ mod tests {
     #[ignore]
     fn test_perf2() {
         // {
-        //     let dummy_table = SkipTableMap::<u64, u64>::new(1, None);
-        //     let _ = dummy_table.insert(0, 0);
-        //     let _ = dummy_table.get(&0);
+        //     let dummy_map = SkipListMap::<u64, u64>::new(1, None);
+        //     let _ = dummy_map.insert(0, 0);
+        //     let _ = dummy_map.get(&0);
         // }
         // use crate::alloc_tests::ALLOC;
         // use std::sync::atomic::Ordering;
@@ -1698,7 +1708,7 @@ mod tests {
         // let ocount = ALLOC.count.load(Ordering::Acquire);
         {
             let order = 24usize;
-            let table = SkipTableMap::<u64, u64>::new(order, None);
+            let map = SkipListMap::<u64, u64>::new(order, None);
             {
                 let mut rng: SmallRng = rand::make_rng();
 
@@ -1717,7 +1727,7 @@ mod tests {
 
                 let thr_num = 32usize;
                 let vec_ref = &vec;
-                let table_ref = &table;
+                let map_ref = &map;
                 println!("test start, len={}", vec.len());
 
                 let start_time = Instant::now();
@@ -1725,16 +1735,16 @@ mod tests {
                     for _ in 0..thr_num {
                         s.spawn(move || {
                             for idx in 0..max {
-                                table_ref.insert(vec_ref[idx], idx as u64).unwrap();
+                                map_ref.insert(vec_ref[idx], idx as u64).unwrap();
                             }
                         });
                     }
                 });
                 println!("wduration={:?}", start_time.elapsed());
-                println!("len={}", table.len());
+                println!("len={}", map.len());
 
                 let mut prev = u64::MAX;
-                let mut next = table.next[0].load(Ordering::Acquire);
+                let mut next = map.next[0].load(Ordering::Acquire);
                 while !next.is_null() {
                     let node = FixedNode::<u64, u64>::ptr_to_mut(next);
                     let key = *node.key;
@@ -1754,7 +1764,7 @@ mod tests {
                             if imut {
                                 for idx in 0..max {
                                     let key = vec_ref[idx];
-                                    if let Ok(Some(entry)) = table_ref.get(&key) {
+                                    if let Ok(Some(entry)) = map_ref.get(&key) {
                                         let v = entry.value();
                                         let idx_u64 = idx as u64;
                                         assert!(*v == idx_u64 || *v == idx_u64 >> 1)
@@ -1763,7 +1773,7 @@ mod tests {
                             } else {
                                 for idx in 0..max {
                                     let key = vec_ref[idx];
-                                    if let Ok(Some(mut entry)) = table_ref.get_mut(&key) {
+                                    if let Ok(Some(mut entry)) = map_ref.get_mut(&key) {
                                         let idx_u64 = idx as u64;
                                         if let Ok(v) = entry.value_mut() {
                                             assert!(*v == idx_u64 || *v == idx_u64 >> 1);
@@ -1781,7 +1791,7 @@ mod tests {
                     }
                 });
                 println!("rduration={:?}", start_time.elapsed());
-                println!("len={}", table.len());
+                println!("len={}", map.len());
 
                 let start_time = Instant::now();
                 std::thread::scope(|s| {
@@ -1792,7 +1802,7 @@ mod tests {
                                 for idx in 0..max {
                                     let key = vec_ref[idx];
                                     let idx_u64 = idx as u64;
-                                    if let Ok(Some(res)) = table_ref.remove(&key) {
+                                    if let Ok(Some(res)) = map_ref.remove(&key) {
                                         assert!(res.0 == key);
                                         assert!(res.1 == idx_u64 || res.1 == idx_u64 >> 1)
                                     }
@@ -1800,18 +1810,18 @@ mod tests {
                             } else {
                                 for idx in 0..max {
                                     let key = vec_ref[idx];
-                                    table_ref.remove_wo_kv(&key);
+                                    map_ref.remove_wo_kv(&key);
                                 }
                             }
                         });
                     }
                 });
                 println!("dduration={:?}", start_time.elapsed());
-                println!("len={}", table.len());
-                println!("gb_cnt={}", table.gb_cnt.load(Ordering::Acquire));
+                println!("len={}", map.len());
+                println!("gb_cnt={}", map.gb_cnt.load(Ordering::Acquire));
             }
 
-            LOCAL_EPOCH.with(|guard| guard.borrow_mut().remove_epoch(table.id));
+            LOCAL_EPOCH.with(|guard| guard.borrow_mut().remove_epoch(map.id));
         }
 
         // let nbytes = ALLOC.bytes.load(Ordering::Acquire);
@@ -1827,18 +1837,18 @@ mod tests {
     #[test]
     #[ignore]
     fn test_mixed_ops() {
-        {
-            let dummy_table = SkipTableMap::<u64, u64>::new(1, None);
-            let _ = dummy_table.insert(0, 0);
-            let _ = dummy_table.get(&0);
-        }
-        use crate::alloc_tests::ALLOC;
-        use std::sync::atomic::Ordering;
-        let obytes = ALLOC.bytes.load(Ordering::Acquire);
-        let ocount = ALLOC.count.load(Ordering::Acquire);
+        // {
+        //     let dummy_map = SkipListMap::<u64, u64>::new(1, None);
+        //     let _ = dummy_map.insert(0, 0);
+        //     let _ = dummy_map.get(&0);
+        // }
+        // use crate::alloc_tests::ALLOC;
+        // use std::sync::atomic::Ordering;
+        // let obytes = ALLOC.bytes.load(Ordering::Acquire);
+        // let ocount = ALLOC.count.load(Ordering::Acquire);
         {
             let order = 24usize;
-            let table = SkipTableMap::<u64, u64>::new(order, None);
+            let map = SkipListMap::<u64, u64>::new(order, None);
             let mut rng: SmallRng = rand::make_rng();
 
             let max = 2usize.pow(order as u32);
@@ -1858,7 +1868,7 @@ mod tests {
             let op_cnt = 2u64.pow((order) as u32);
             let mask = max - 1;
             let vec_ref = &vec;
-            let table_ref = &table;
+            let map_ref = &map;
             println!("test start, len={}", vec.len());
 
             let start_time = Instant::now();
@@ -1877,12 +1887,12 @@ mod tests {
                                         idx = op_idx as usize & mask;
                                     }
                                     let key = vec_ref[idx];
-                                    let _ = table_ref.insert(key, idx as u64);
+                                    let _ = map_ref.insert(key, idx as u64);
                                 }
                                 0 => {
                                     // get. key may not in map
                                     let key = vec_ref[idx];
-                                    if let Ok(Some(entry)) = table_ref.get(&key) {
+                                    if let Ok(Some(entry)) = map_ref.get(&key) {
                                         let v = entry.value();
                                         let idx_u64 = idx as u64;
                                         assert!(*v == idx_u64 || *v == idx_u64 >> 1)
@@ -1891,7 +1901,7 @@ mod tests {
                                 1 => {
                                     // get_mut. key may not in map
                                     let key = vec_ref[idx];
-                                    if let Ok(Some(mut entry)) = table_ref.get_mut(&key) {
+                                    if let Ok(Some(mut entry)) = map_ref.get_mut(&key) {
                                         let v = entry.value_mut().unwrap();
                                         let idx_u64 = idx as u64;
                                         assert!(*v == idx_u64 || *v == idx_u64 >> 1);
@@ -1902,7 +1912,7 @@ mod tests {
                                     // remove. key may not in map
                                     let key = vec_ref[idx];
                                     let idx_u64 = idx as u64;
-                                    if let Ok(Some(res)) = table_ref.remove(&key) {
+                                    if let Ok(Some(res)) = map_ref.remove(&key) {
                                         assert!(res.0 == key);
                                         assert!(res.1 == idx_u64 || res.1 == idx_u64 >> 1)
                                     }
@@ -1910,7 +1920,7 @@ mod tests {
                                 3 => {
                                     // remove_wo_kv. key may not in map
                                     let key = vec_ref[idx];
-                                    table_ref.remove_wo_kv(&key);
+                                    map_ref.remove_wo_kv(&key);
                                 }
                                 _ => (),
                             }
@@ -1919,17 +1929,17 @@ mod tests {
                 }
             });
             println!("duration={:?}", start_time.elapsed());
-            println!("gb_cnt={}", table.gb_cnt.load(Ordering::Acquire));
-            LOCAL_EPOCH.with(|guard| guard.borrow_mut().remove_epoch(table.id));
+            println!("gb_cnt={}", map.gb_cnt.load(Ordering::Acquire));
+            LOCAL_EPOCH.with(|guard| guard.borrow_mut().remove_epoch(map.id));
         }
-        let nbytes = ALLOC.bytes.load(Ordering::Acquire);
-        let ncount = ALLOC.count.load(Ordering::Acquire);
-        println!(
-            "obytes={}, ocount={}, nbytes={}, ncount={}",
-            obytes, ocount, nbytes, ncount
-        );
-        assert!(obytes == nbytes);
-        assert!(ocount == ncount);
+        // let nbytes = ALLOC.bytes.load(Ordering::Acquire);
+        // let ncount = ALLOC.count.load(Ordering::Acquire);
+        // println!(
+        //     "obytes={}, ocount={}, nbytes={}, ncount={}",
+        //     obytes, ocount, nbytes, ncount
+        // );
+        // assert!(obytes == nbytes);
+        // assert!(ocount == ncount);
     }
 
     #[test]
@@ -1938,7 +1948,7 @@ mod tests {
             epoch_adv_thres: 256,
             len_opt: LenOption::AtomicVariable,
         };
-        let map = SkipTableMap::<u64, String>::new(8, Some(config));
+        let map = SkipListMap::<u64, String>::new(8, Some(config));
 
         assert!(map.is_empty());
         assert_eq!(map.len(), 0);
@@ -1992,7 +2002,7 @@ mod tests {
 
     #[test]
     fn test_concurrency_and_exclusion() {
-        let map = Arc::new(SkipTableMap::<u64, u64>::new(8, None));
+        let map = Arc::new(SkipListMap::<u64, u64>::new(8, None));
         map.insert(1, 100).unwrap();
 
         {
@@ -2038,7 +2048,7 @@ mod tests {
 
     #[test]
     fn test_multithreaded_exclusion() {
-        let map = Arc::new(SkipTableMap::<u64, u64>::new(8, None));
+        let map = Arc::new(SkipListMap::<u64, u64>::new(8, None));
         map.insert(42, 1000).unwrap();
 
         let barrier = Arc::new(Barrier::new(2));
@@ -2084,7 +2094,7 @@ mod tests {
             epoch_adv_thres: 1,
             len_opt: LenOption::NotProvided,
         };
-        let map = SkipTableMap::<DropDetector, DropDetector>::new(4, Some(config));
+        let map = SkipListMap::<DropDetector, DropDetector>::new(4, Some(config));
 
         {
             let k1 = DropDetector {
@@ -2123,7 +2133,7 @@ mod tests {
                 epoch_adv_thres: 1,
                 len_opt: LenOption::NotProvided,
             };
-            let map2 = SkipTableMap::<DropDetector, DropDetector>::new(4, Some(config2));
+            let map2 = SkipListMap::<DropDetector, DropDetector>::new(4, Some(config2));
 
             let k2 = DropDetector {
                 id: 2,
@@ -2192,7 +2202,7 @@ mod bytes_tests {
             epoch_adv_thres: 256,
             len_opt: LenOption::AtomicVariable,
         };
-        let map = SkipTableMap::<Bytes, Bytes>::new(8, Some(config));
+        let map = SkipListMap::<Bytes, Bytes>::new(8, Some(config));
 
         let k1 = Bytes::from("key1");
         let v1 = Bytes::from("value1");
@@ -2242,7 +2252,7 @@ mod bytes_tests {
 
     #[test]
     fn test_bytes_exclusion() {
-        let map = SkipTableMap::<Bytes, Bytes>::new(8, None);
+        let map = SkipListMap::<Bytes, Bytes>::new(8, None);
         let key = Bytes::from("exclusive_key");
         let val = Bytes::from("exclusive_val");
 

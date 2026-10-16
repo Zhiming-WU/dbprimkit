@@ -1,7 +1,7 @@
-use dbprimkit::skiptable::map::ordinary::SkipTableMap;
+use dbprimkit::skiplist::map::ordinary::SkipListMap;
 
 fn main() {
-    let mut map = SkipTableMap::<i32, String>::new(16);
+    let mut map = SkipListMap::<i32, String>::new(16);
 
     assert!(map.is_empty());
     assert_eq!(map.len(), 0);

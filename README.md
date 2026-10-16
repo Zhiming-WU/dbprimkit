@@ -3,6 +3,6 @@ Currently below items are thought to be available, but NOTE they may be changed 
 including their interfaces).
 - [ringbuffer]
 - [appender]
-- [skiptable::map] (skip table map)
+- [skiplist] (map and set based on skip list)
 - [sync::spinlock]
 - [wal] (Write Ahead Log)

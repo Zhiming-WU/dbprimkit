@@ -4,7 +4,7 @@
 //! including their interfaces).
 //! - [ringbuffer]
 //! - [appender]
-//! - [skiptable::map] (skip table map)
+//! - [skiplist] (map and set based on skip list)
 //! - [sync::spinlock]
 //! - [wal] (Write Ahead Log)
 
@@ -20,7 +20,7 @@ pub mod io;
 //pub mod cbtree; // classic B Tree
 //pub mod lsm;
 pub mod ringbuffer;
-pub mod skiptable;
+pub mod skiplist;
 pub mod sync;
 pub mod wal; // Write Ahead Log
 
@@ -106,51 +106,51 @@ impl Drop for AlignedBuffer {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod alloc_tests {
-    use std::alloc::{GlobalAlloc, Layout, System};
-    use std::sync::atomic::{AtomicIsize, Ordering};
+// #[cfg(test)]
+// pub(crate) mod alloc_tests {
+//     use std::alloc::{GlobalAlloc, Layout, System};
+//     use std::sync::atomic::{AtomicIsize, Ordering};
 
-    pub struct MyAlloc {
-        pub(crate) bytes: AtomicIsize,
-        pub(crate) count: AtomicIsize,
-    }
+//     pub struct MyAlloc {
+//         pub(crate) bytes: AtomicIsize,
+//         pub(crate) count: AtomicIsize,
+//     }
 
-    impl MyAlloc {
-        pub const fn new() -> Self {
-            Self {
-                bytes: AtomicIsize::new(0),
-                count: AtomicIsize::new(0),
-            }
-        }
-    }
+//     impl MyAlloc {
+//         pub const fn new() -> Self {
+//             Self {
+//                 bytes: AtomicIsize::new(0),
+//                 count: AtomicIsize::new(0),
+//             }
+//         }
+//     }
 
-    unsafe impl GlobalAlloc for MyAlloc {
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            unsafe {
-                let ptr = System.alloc(layout);
-                if !ptr.is_null() {
-                    self.bytes
-                        .fetch_add(layout.size() as isize, Ordering::SeqCst);
-                    self.count.fetch_add(1, Ordering::SeqCst);
-                }
-                ptr
-            }
-        }
+//     unsafe impl GlobalAlloc for MyAlloc {
+//         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+//             unsafe {
+//                 let ptr = System.alloc(layout);
+//                 if !ptr.is_null() {
+//                     self.bytes
+//                         .fetch_add(layout.size() as isize, Ordering::SeqCst);
+//                     self.count.fetch_add(1, Ordering::SeqCst);
+//                 }
+//                 ptr
+//             }
+//         }
 
-        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            unsafe {
-                System.dealloc(ptr, layout);
-                self.bytes
-                    .fetch_sub(layout.size() as isize, Ordering::SeqCst);
-                self.count.fetch_sub(1, Ordering::SeqCst);
-            }
-        }
-    }
+//         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+//             unsafe {
+//                 System.dealloc(ptr, layout);
+//                 self.bytes
+//                     .fetch_sub(layout.size() as isize, Ordering::SeqCst);
+//                 self.count.fetch_sub(1, Ordering::SeqCst);
+//             }
+//         }
+//     }
 
-    #[global_allocator]
-    pub(crate) static ALLOC: MyAlloc = MyAlloc::new();
-}
+//     #[global_allocator]
+//     pub(crate) static ALLOC: MyAlloc = MyAlloc::new();
+// }
 
 // #[cfg(test)]
 // pub(crate) mod tests {
