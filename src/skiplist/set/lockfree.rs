@@ -108,6 +108,66 @@ impl<T> SkipListSet<T> {
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
+
+    /// Returns a reference to the first element in the set, if any.
+    pub fn first_elem(&self) -> Option<ElementRef<T>> {
+        self.inner.first_entry().unwrap().map(|e| ElementRef(e))
+    }
+
+    /// Returns a reference to the last element in the set, if any.
+    pub fn last_elem(&self) -> Option<ElementRef<T>> {
+        self.inner.last_entry().unwrap().map(|e| ElementRef(e))
+    }
+
+    /// Returns a reference to the element that immediately after the `value`, if any.
+    pub fn next_elem<Q>(&self, value: &Q) -> Option<ElementRef<T>>
+    where
+        T: Borrow<Q> + Ord,
+        Q: Ord + ?Sized,
+    {
+        self.inner.next_entry(value).unwrap().map(|e| ElementRef(e))
+    }
+
+    /// Returns a reference to the element that immediately before the `value`, if any.
+    pub fn prev_elem<Q>(&self, value: &Q) -> Option<ElementRef<T>>
+    where
+        T: Borrow<Q> + Ord,
+        Q: Ord + ?Sized,
+    {
+        self.inner.prev_entry(value).unwrap().map(|e| ElementRef(e))
+    }
+
+    /// Clears the set, removing all elements.
+    /// <div class="warning">
+    ///
+    /// **CAUTION**
+    ///
+    /// See the CAUTION description for [super::lockfree::SkipListMap::clear]
+    ///
+    /// It may be an option to create a new set instead of calling this method.
+    ///
+    /// </div>
+    pub fn clear(&self) {
+        self.inner.clear();
+    }
+
+    /// Iterate elements with a function.
+    /// <div class="warning">
+    ///
+    /// **CAUTION**
+    ///
+    /// See the CAUTION description for [super::lockfree::SkipListMap::iter_with]
+    ///
+    /// It may be an option to use [SkipListSet::next_elem] with with [SkipListSet::first_elem]
+    /// to achieve iteration.
+    ///
+    /// </div>
+    pub fn iter_with<F>(&self, mut func: F)
+    where
+        F: FnMut(ElementRef<T>),
+    {
+        self.inner.iter_with(|e| func(ElementRef(e)));
+    }
 }
 
 /// The reference to a element in the [SkipListSet].
@@ -262,5 +322,85 @@ mod tests {
         for i in 0..100000 {
             assert!(set.contains(&i), "Element {} missing", i);
         }
+    }
+
+    #[test]
+    fn test_first_and_last_elem() {
+        let set = create_test_set();
+
+        assert!(set.first_elem().is_none());
+        assert!(set.last_elem().is_none());
+
+        set.insert(20);
+        assert_eq!(*set.first_elem().unwrap(), 20);
+        assert_eq!(*set.last_elem().unwrap(), 20);
+
+        set.insert(10);
+        set.insert(30);
+        set.insert(5);
+
+        assert_eq!(*set.first_elem().unwrap(), 5);
+        assert_eq!(*set.last_elem().unwrap(), 30);
+    }
+
+    #[test]
+    fn test_next_and_prev_elem() {
+        let set = create_test_set();
+
+        set.insert(20);
+        set.insert(10);
+        set.insert(40);
+        set.insert(30);
+
+        assert_eq!(*set.next_elem(&10).unwrap(), 20);
+        assert_eq!(*set.next_elem(&25).unwrap(), 30);
+        assert_eq!(*set.next_elem(&0).unwrap(), 10);
+        assert!(set.next_elem(&40).is_none());
+        assert!(set.next_elem(&50).is_none());
+
+        assert_eq!(*set.prev_elem(&40).unwrap(), 30);
+        assert_eq!(*set.prev_elem(&25).unwrap(), 20);
+        assert_eq!(*set.prev_elem(&50).unwrap(), 40);
+        assert!(set.prev_elem(&10).is_none());
+        assert!(set.prev_elem(&0).is_none());
+    }
+
+    #[test]
+    fn test_clear() {
+        let set = create_test_set();
+
+        set.insert(1);
+        set.insert(2);
+        set.insert(3);
+        assert!(!set.is_empty());
+
+        set.clear();
+
+        assert!(set.is_empty());
+        assert!(!set.contains(&1));
+        assert!(set.first_elem().is_none());
+        assert!(set.last_elem().is_none());
+    }
+
+    #[test]
+    fn test_iter_with() {
+        let set = create_test_set();
+        set.insert(30);
+        set.insert(10);
+        set.insert(20);
+
+        let mut collected = Vec::new();
+        set.iter_with(|elem| {
+            collected.push(*elem);
+        });
+
+        assert_eq!(collected, vec![10, 20, 30]);
+
+        let empty_set = create_test_set();
+        let mut empty_collected = Vec::new();
+        empty_set.iter_with(|elem| {
+            empty_collected.push(*elem);
+        });
+        assert!(empty_collected.is_empty());
     }
 }

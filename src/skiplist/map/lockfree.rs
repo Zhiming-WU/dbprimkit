@@ -1,7 +1,23 @@
 //! A key-value map based on skip list. It's designed to be used in concurrent mode and performance
 //! takes high priority. It has narrower APIs comapred to [super::ordinary].
 //!
-//! EBR (epoch based reclamation) approach is used to safely free objects.
+//! EBR (epoch based reclamation) approach is used to safely free objects (map entries). Objects deleted
+//! in current epoch are not immediately freed in current epoch but in later epoch, so that other users
+//! who concurrently (in parallel) traverse the map don't encounter use-after-free problem.
+//!
+//! <div class="warning" id="caution_epoch_pinner">
+//!
+//! **CAUTION**
+//!
+//! The postponing of freeing objects is done by holding a `EpochPinner` which prevents the epoch
+//! from advancing. If you do some operation (something like [SkipListMap::iter_with],
+//! [SkipListMap::iter_mut_with] or [SkipListMap::clear])
+//! which holds a `EpochPinner` too long, it prevents the epoch from advancing, which means deleted objects
+//! may not get freed in time, and it also causes the thread which is trying to advance the epoch (potential
+//! performed in [SkipListMap::remove] or [SkipListMap::remove_wo_kv], etc.) stuck at waiting the finish of
+//! the `EpochPinner`.
+//!
+//! </div>
 //!
 //! Below is an example.
 //! ```rust
@@ -486,17 +502,21 @@ impl<K, V> FixedNode<K, V> {
     }
 
     #[inline]
-    fn unxor_flags(&self, mask: u32) {
+    fn set_unset_flags(&self, set: bool, mask: u32) {
         let mut flags = self.flags.load(Ordering::Acquire);
-        loop {
+        let mut nflags = if set { flags | mask } else { flags & !mask };
+        while nflags != flags {
             match self.flags.compare_exchange_weak(
                 flags,
-                flags & !mask,
+                nflags,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
                 Ok(_) => break,
-                Err(f) => flags = f,
+                Err(f) => {
+                    flags = f;
+                    nflags = if set { flags | mask } else { flags & !mask };
+                }
             }
         }
     }
@@ -1070,7 +1090,7 @@ impl<K, V> SkipListMap<K, V> {
                                     std::mem::swap(&mut key, &mut node.key);
                                 }
                                 std::mem::swap(&mut value, &mut node.value);
-                                node.unxor_flags(FLAG_UPDATING_VALUE);
+                                node.set_unset_flags(false, FLAG_UPDATING_VALUE);
                                 return Ok(Some((key, value)));
                             }
                             Err(f) => {
@@ -1091,7 +1111,7 @@ impl<K, V> SkipListMap<K, V> {
                     let _node = Node::<K, V>::from_node_ptr(ptr);
                     continue 'main_loop;
                 }
-                node.unxor_flags(FLAG_LINKING);
+                node.set_unset_flags(false, FLAG_LINKING);
                 if let LenOption::AtomicVariable = self.config.len_opt {
                     self.ent_cnt.fetch_add(1, Ordering::Release);
                 }
@@ -1279,7 +1299,8 @@ impl<K, V> SkipListMap<K, V> {
 
     /// Returns a reference to the entry corresponding to the key.
     ///
-    /// [ElementInMutUse] is returned if the the entry is being used by others via [SkipListMap::get_mut].
+    /// [ElementInMutUse] is returned if the the entry is being used by others via something like
+    /// [SkipListMap::get_mut].
     pub fn get<Q>(&self, key: &Q) -> Result<Option<EntryRef<K, V>>>
     where
         Q: Ord + ?Sized,
@@ -1291,8 +1312,8 @@ impl<K, V> SkipListMap<K, V> {
 
     /// Returns a mutable reference to the entry corresponding to the key.
     ///
-    /// [ElementInUse] is returned if the the entry is being used by others via [SkipListMap::get]
-    /// or [SkipListMap::get_mut].
+    /// [ElementInUse] is returned if the the entry is being used by others via something like
+    /// [SkipListMap::get] or [SkipListMap::get_mut].
     pub fn get_mut<Q>(&self, key: &Q) -> Result<Option<EntryRef<K, V>>>
     where
         Q: Ord + ?Sized,
@@ -1302,22 +1323,11 @@ impl<K, V> SkipListMap<K, V> {
         LOCAL_EPOCH.with(|guard| self.get_inner(key, true, guard.borrow_mut().get_epoch(id)))
     }
 
-    fn get_inner<Q>(
-        &self,
-        key: &Q,
-        mutable: bool,
-        epoch: &mut LocalEpoch,
-    ) -> Result<Option<EntryRef<K, V>>>
-    where
-        Q: Ord + ?Sized,
-        K: Borrow<Q> + Ord,
-    {
-        let _pin = LocalEpochPinner::new(epoch, &self.epoch);
-        let sch_ptr = self.search(key);
-        if sch_ptr.is_null() {
+    fn get_entry_ref(&self, ptr: NodePtr, mutable: bool) -> Result<Option<EntryRef<K, V>>> {
+        if ptr.is_null() {
             Ok(None)
         } else {
-            let node = FixedNode::<K, V>::ptr_to_mut(sch_ptr);
+            let node = FixedNode::<K, V>::ptr_to_mut(ptr);
             let mut flags = node.flags.load(Ordering::Acquire);
             loop {
                 if flags & FLAG_DELETED != 0 {
@@ -1340,7 +1350,7 @@ impl<K, V> SkipListMap<K, V> {
                             Ordering::Acquire,
                         ) {
                             Ok(_) => {
-                                return Ok(Some(EntryRef::<K, V>::from_ptr(sch_ptr, mutable)));
+                                return Ok(Some(EntryRef::<K, V>::from_ptr(ptr, mutable)));
                             }
                             Err(f) => {
                                 flags = f;
@@ -1352,11 +1362,26 @@ impl<K, V> SkipListMap<K, V> {
                     } else if !mutable && flags & FLAG_IN_MUT_USE != 0 {
                         return Err(ElementInMutUse);
                     } else {
-                        return Ok(Some(EntryRef::<K, V>::from_ptr(sch_ptr, false)));
+                        return Ok(Some(EntryRef::<K, V>::from_ptr(ptr, false)));
                     }
                 }
             }
         }
+    }
+
+    fn get_inner<Q>(
+        &self,
+        key: &Q,
+        mutable: bool,
+        epoch: &mut LocalEpoch,
+    ) -> Result<Option<EntryRef<K, V>>>
+    where
+        Q: Ord + ?Sized,
+        K: Borrow<Q> + Ord,
+    {
+        let _pin = LocalEpochPinner::new(epoch, &self.epoch);
+        let sch_ptr = self.search(key);
+        self.get_entry_ref(sch_ptr, mutable)
     }
 
     /// Returns the number of elements in the map. NOTE that by default it doesn't work (always returns 0)
@@ -1424,6 +1449,310 @@ impl<K, V> SkipListMap<K, V> {
     {
         let _pin = LocalEpochPinner::new(epoch, &self.epoch);
         !self.search(key).is_null()
+    }
+
+    /// Returns a reference to the first entry, if any.
+    ///
+    /// [ElementInMutUse] is returned if the the entry is being used by others via something like
+    /// [SkipListMap::get_mut] or [SkipListMap::first_entry_mut].
+    pub fn first_entry(&self) -> Result<Option<EntryRef<K, V>>> {
+        let id = self.id;
+        LOCAL_EPOCH.with(|guard| self.first_entry_inner(false, guard.borrow_mut().get_epoch(id)))
+    }
+
+    /// Returns a mutable reference to the first entry, if any.
+    ///
+    /// [ElementInUse] is returned if the the entry is being used by others via something like
+    /// [SkipListMap::get], [SkipListMap::get_mut], [SkipListMap::first_entry] or [SkipListMap::first_entry_mut].
+    pub fn first_entry_mut(&self) -> Result<Option<EntryRef<K, V>>> {
+        let id = self.id;
+        LOCAL_EPOCH.with(|guard| self.first_entry_inner(true, guard.borrow_mut().get_epoch(id)))
+    }
+
+    fn first_entry_inner(
+        &self,
+        mutable: bool,
+        epoch: &mut LocalEpoch,
+    ) -> Result<Option<EntryRef<K, V>>> {
+        let _pin = LocalEpochPinner::new(epoch, &self.epoch);
+        let ptr = self.next[0].load(Ordering::Acquire);
+        self.get_entry_ref(ptr, mutable)
+    }
+
+    fn search_last(&self) -> NodePtr {
+        let null: *mut u8 = std::ptr::null_mut();
+        let mut level = self.max_height - 1;
+        let mut next: NodePtr = null;
+        let mut res: NodePtr = null;
+
+        'level_loop: loop {
+            if next.is_null() {
+                next = self.next[level].load(Ordering::Acquire);
+            }
+
+            'same_level: loop {
+                if next.is_null() {
+                    if level == 0 {
+                        break 'level_loop;
+                    }
+                    level -= 1;
+                    continue 'level_loop;
+                } else {
+                    res = next;
+                    let tmp_next = FixedNode::<K, V>::fn_get_next_ptr(next, level);
+                    if !tmp_next.is_null() {
+                        next = tmp_next;
+                        continue 'same_level;
+                    } else {
+                        if level == 0 {
+                            break 'level_loop;
+                        }
+                        level -= 1;
+                        continue 'level_loop;
+                    }
+                }
+            }
+        }
+        res
+    }
+
+    /// Returns a reference to the last entry, if any.
+    ///
+    /// [ElementInMutUse] is returned if the the entry is being used by others via something like
+    /// [SkipListMap::get_mut] or [SkipListMap::last_entry_mut].
+    pub fn last_entry(&self) -> Result<Option<EntryRef<K, V>>> {
+        let id = self.id;
+        LOCAL_EPOCH.with(|guard| self.last_entry_inner(false, guard.borrow_mut().get_epoch(id)))
+    }
+
+    /// Returns a mutable reference to the last entry, if any.
+    ///
+    /// [ElementInUse] is returned if the the entry is being used by others via something like
+    /// [SkipListMap::get], [SkipListMap::get_mut], [SkipListMap::last_entry] or [SkipListMap::last_entry_mut].
+    pub fn last_entry_mut(&self) -> Result<Option<EntryRef<K, V>>> {
+        let id = self.id;
+        LOCAL_EPOCH.with(|guard| self.last_entry_inner(true, guard.borrow_mut().get_epoch(id)))
+    }
+
+    fn last_entry_inner(
+        &self,
+        mutable: bool,
+        epoch: &mut LocalEpoch,
+    ) -> Result<Option<EntryRef<K, V>>> {
+        let _pin = LocalEpochPinner::new(epoch, &self.epoch);
+        let ptr = self.search_last();
+        self.get_entry_ref(ptr, mutable)
+    }
+
+    /// Returns a reference to the entry that immediately after the `key`, if any.
+    ///
+    /// [ElementInMutUse] is returned if the the entry is being mutably used by others.
+    pub fn next_entry<Q>(&self, key: &Q) -> Result<Option<EntryRef<K, V>>>
+    where
+        Q: Ord + ?Sized,
+        K: Borrow<Q> + Ord,
+    {
+        let id = self.id;
+        LOCAL_EPOCH.with(|guard| {
+            self.next_or_prev_entry_inner(key, true, false, guard.borrow_mut().get_epoch(id))
+        })
+    }
+
+    /// Returns a mutable reference to the entry that immediately after the `key`, if any.
+    ///
+    /// [ElementInUse] is returned if the the entry is being used by others.
+    pub fn next_entry_mut<Q>(&self, key: &Q) -> Result<Option<EntryRef<K, V>>>
+    where
+        Q: Ord + ?Sized,
+        K: Borrow<Q> + Ord,
+    {
+        let id = self.id;
+        LOCAL_EPOCH.with(|guard| {
+            self.next_or_prev_entry_inner(key, true, true, guard.borrow_mut().get_epoch(id))
+        })
+    }
+
+    /// Returns a reference to the entry that immediately before the `key`, if any.
+    ///
+    /// [ElementInMutUse] is returned if the the entry is being mutably used by others.
+    pub fn prev_entry<Q>(&self, key: &Q) -> Result<Option<EntryRef<K, V>>>
+    where
+        Q: Ord + ?Sized,
+        K: Borrow<Q> + Ord,
+    {
+        let id = self.id;
+        LOCAL_EPOCH.with(|guard| {
+            self.next_or_prev_entry_inner(key, false, false, guard.borrow_mut().get_epoch(id))
+        })
+    }
+
+    /// Returns a mutable reference to the entry that immediately before the `key`, if any.
+    ///
+    /// [ElementInUse] is returned if the the entry is being used by others.
+    pub fn prev_entry_mut<Q>(&self, key: &Q) -> Result<Option<EntryRef<K, V>>>
+    where
+        Q: Ord + ?Sized,
+        K: Borrow<Q> + Ord,
+    {
+        let id = self.id;
+        LOCAL_EPOCH.with(|guard| {
+            self.next_or_prev_entry_inner(key, false, true, guard.borrow_mut().get_epoch(id))
+        })
+    }
+
+    fn next_or_prev_entry_inner<Q>(
+        &self,
+        key: &Q,
+        is_next: bool,
+        mutable: bool,
+        epoch: &mut LocalEpoch,
+    ) -> Result<Option<EntryRef<K, V>>>
+    where
+        Q: Ord + ?Sized,
+        K: Borrow<Q> + Ord,
+    {
+        let mut vec = PrecVec::new();
+        let _pin = LocalEpochPinner::new(epoch, &self.epoch);
+        loop {
+            let res_ptr = self.search_ext(key, 1, 0, &mut vec);
+            let ptr = {
+                let ent = vec.get_ent(0);
+                if is_next {
+                    if !res_ptr.is_null() {
+                        FixedNode::<K, V>::fn_get_next_ptr(res_ptr, 0)
+                    } else {
+                        ent.next
+                    }
+                } else {
+                    ent.prec
+                }
+            };
+            if ptr.is_null() {
+                return Ok(None);
+            }
+            match self.get_entry_ref(ptr, mutable) {
+                Ok(None) => {
+                    // entry is deleted, retry
+                    std::hint::spin_loop();
+                    continue;
+                }
+                res @ _ => return res,
+            }
+        }
+    }
+
+    /// Clears the map, removing all elements.
+    ///
+    /// <div class="warning">
+    ///
+    /// **CAUTION**
+    ///
+    /// This operation holds a `EpochPinner` for long if the number of entries in the map is large.
+    /// See [the descreption here](super::lockfree#caution_epoch_pinner).
+    ///
+    /// Also notice that if concurrent inserting occurs, whether the inserted entry is cleared
+    /// from the mapis not certain, depending on its position and timing inserted.
+    ///
+    /// It may be an option to create a new map instead of calling this method.
+    ///
+    /// </div>
+    pub fn clear(&self) {
+        let id = self.id;
+        LOCAL_EPOCH.with(|guard| self.clear_inner(guard.borrow_mut().get_epoch(id)))
+    }
+
+    fn clear_inner(&self, epoch: &mut LocalEpoch) {
+        let null: NodePtr = std::ptr::null_mut();
+        for level in (1..self.max_height).rev() {
+            self.next[level].store(null, Ordering::Release);
+        }
+        let pin = LocalEpochPinner::new(epoch, &self.epoch);
+        let epoch = pin.0.gepoch;
+        let mut next = self.next[0].swap(null, Ordering::AcqRel);
+        while !next.is_null() {
+            let node = FixedNode::<K, V>::ptr_to_mut(next);
+            node.set_unset_flags(true, FLAG_DELETED);
+            self.put_garbage(epoch, next, node.height);
+            next = node.get_next_ptr(next, 0);
+        }
+        drop(pin);
+        self.adv_epoch(epoch);
+    }
+
+    /// Iterate entries with a function.
+    ///
+    /// <div class="warning">
+    ///
+    /// **CAUTION**
+    ///
+    /// This operation holds a `EpochPinner` for long if the number of entries in the map is large.
+    /// See [the descreption here](super::lockfree#caution_epoch_pinner).
+    ///
+    /// Also notice that the entries being mutably used by others are skipped to call the provided
+    /// function.
+    ///
+    /// It may be an option to use [SkipListMap::next_entry] with with [SkipListMap::first_entry]
+    /// to achieve iteration.
+    ///
+    /// </div>
+    pub fn iter_with<F>(&self, func: F)
+    where
+        F: FnMut(EntryRef<K, V>),
+    {
+        let id = self.id;
+        LOCAL_EPOCH.with(|guard| self.iter_with_inner(func, guard.borrow_mut().get_epoch(id)))
+    }
+
+    fn iter_with_inner<F>(&self, mut func: F, epoch: &mut LocalEpoch)
+    where
+        F: FnMut(EntryRef<K, V>),
+    {
+        let _pin = LocalEpochPinner::new(epoch, &self.epoch);
+        let mut ptr = self.next[0].load(Ordering::Acquire);
+        while !ptr.is_null() {
+            if let Ok(Some(ent)) = self.get_entry_ref(ptr, false) {
+                func(ent);
+            }
+            ptr = FixedNode::<K, V>::fn_get_next_ptr(ptr, 0);
+        }
+    }
+
+    /// Mutably iterate entries with a function.
+    ///
+    /// <div class="warning">
+    ///
+    /// **CAUTION**
+    ///
+    /// This operation holds a `EpochPinner` for long if the number of entries in the map is large.
+    /// See [the descreption here](super::lockfree#caution_epoch_pinner).
+    ///
+    /// Also notice that the entries being used by others are skipped to call the provided
+    /// function.
+    ///
+    /// It may be an option to use [SkipListMap::next_entry_mut] with [SkipListMap::first_entry_mut]
+    /// to achieve iteration.
+    ///
+    /// </div>
+    pub fn iter_mut_with<F>(&self, func: F)
+    where
+        F: FnMut(EntryRef<K, V>),
+    {
+        let id = self.id;
+        LOCAL_EPOCH.with(|guard| self.iter_mut_with_inner(func, guard.borrow_mut().get_epoch(id)))
+    }
+
+    fn iter_mut_with_inner<F>(&self, mut func: F, epoch: &mut LocalEpoch)
+    where
+        F: FnMut(EntryRef<K, V>),
+    {
+        let _pin = LocalEpochPinner::new(epoch, &self.epoch);
+        let mut ptr = self.next[0].load(Ordering::Acquire);
+        while !ptr.is_null() {
+            if let Ok(Some(ent)) = self.get_entry_ref(ptr, true) {
+                func(ent);
+            }
+            ptr = FixedNode::<K, V>::fn_get_next_ptr(ptr, 0);
+        }
     }
 }
 
@@ -2281,5 +2610,215 @@ mod bytes_tests {
         }
 
         assert!(map.remove(&key).unwrap().is_some());
+    }
+}
+
+#[cfg(test)]
+mod iter_and_clear_tests {
+    use super::*;
+
+    fn setup_test_map() -> SkipListMap<u64, String> {
+        let config = TunableConfig {
+            epoch_adv_thres: 256,
+            len_opt: LenOption::AtomicVariable,
+        };
+        let map = SkipListMap::<u64, String>::new(8, Some(config));
+        map.insert(20, "twenty".to_string()).unwrap();
+        map.insert(10, "ten".to_string()).unwrap();
+        map.insert(30, "thirty".to_string()).unwrap();
+        map
+    }
+
+    #[test]
+    fn test_first_and_last_entry() {
+        let map = setup_test_map();
+
+        {
+            let first = map.first_entry().unwrap().expect("Should have first entry");
+            assert_eq!(*first.key(), 10);
+            assert_eq!(first.value(), "ten");
+        }
+
+        {
+            let last = map.last_entry().unwrap().expect("Should have last entry");
+            assert_eq!(*last.key(), 30);
+            assert_eq!(last.value(), "thirty");
+        }
+
+        let empty_map = SkipListMap::<u64, u64>::new(4, None);
+        assert!(empty_map.first_entry().unwrap().is_none());
+        assert!(empty_map.last_entry().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_first_and_last_entry_mut() {
+        let map = setup_test_map();
+
+        {
+            let mut first_mut = map
+                .first_entry_mut()
+                .unwrap()
+                .expect("Should have first entry");
+            assert_eq!(*first_mut.key(), 10);
+            let val = first_mut.value_mut().unwrap();
+            *val = "TEN_MUTATED".to_string();
+        }
+
+        {
+            let first = map.first_entry().unwrap().unwrap();
+            assert_eq!(first.value(), "TEN_MUTATED");
+        }
+
+        {
+            let mut last_mut = map
+                .last_entry_mut()
+                .unwrap()
+                .expect("Should have last entry");
+            assert_eq!(*last_mut.key(), 30);
+            let val = last_mut.value_mut().unwrap();
+            *val = "THIRTY_MUTATED".to_string();
+        }
+
+        {
+            let last = map.last_entry().unwrap().unwrap();
+            assert_eq!(last.value(), "THIRTY_MUTATED");
+        }
+
+        let empty_map = SkipListMap::<u64, u64>::new(4, None);
+        assert!(empty_map.first_entry_mut().unwrap().is_none());
+        assert!(empty_map.last_entry_mut().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_next_and_prev_entry() {
+        let map = setup_test_map();
+
+        {
+            let prev = map.prev_entry(&20).unwrap().unwrap();
+            assert_eq!(*prev.key(), 10);
+
+            let next = map.next_entry(&20).unwrap().unwrap();
+            assert_eq!(*next.key(), 30);
+
+            assert!(map.prev_entry(&10).unwrap().is_none());
+            let next_of_10 = map.next_entry(&10).unwrap().unwrap();
+            assert_eq!(*next_of_10.key(), 20);
+
+            assert!(map.next_entry(&30).unwrap().is_none());
+            let prev_of_30 = map.prev_entry(&30).unwrap().unwrap();
+            assert_eq!(*prev_of_30.key(), 20);
+
+            let prev_of_15 = map.prev_entry(&15).unwrap().unwrap();
+            assert_eq!(*prev_of_15.key(), 10);
+
+            let next_of_15 = map.next_entry(&15).unwrap().unwrap();
+            assert_eq!(*next_of_15.key(), 20);
+        }
+    }
+
+    #[test]
+    fn test_next_and_prev_entry_mut() {
+        let map = setup_test_map();
+
+        {
+            let mut next_mut = map.next_entry_mut(&10).unwrap().unwrap(); // key = 20
+            assert_eq!(*next_mut.key(), 20);
+            *next_mut.value_mut().unwrap() = "TWENTY_MUTATED".to_string();
+        }
+
+        {
+            let mut prev_mut = map.prev_entry_mut(&30).unwrap().unwrap(); // key = 20
+            assert_eq!(*prev_mut.key(), 20);
+            assert_eq!(prev_mut.value(), "TWENTY_MUTATED");
+            *prev_mut.value_mut().unwrap() = "TWENTY_MUTATED_AGAIN".to_string();
+        }
+
+        let entry_20 = map.get(&20).unwrap().unwrap();
+        assert_eq!(entry_20.value(), "TWENTY_MUTATED_AGAIN");
+    }
+
+    #[test]
+    fn test_clear() {
+        let map = setup_test_map();
+
+        assert!(!map.is_empty());
+        assert_eq!(map.len(), 3);
+
+        map.clear();
+
+        assert!(map.is_empty());
+        assert!(map.first_entry().unwrap().is_none());
+        assert!(map.last_entry().unwrap().is_none());
+        assert!(!map.contains_key(&10));
+        assert!(!map.contains_key(&20));
+        assert!(!map.contains_key(&30));
+    }
+
+    #[test]
+    fn test_iter_with() {
+        let map = setup_test_map();
+
+        let mut visited = Vec::new();
+        map.iter_with(|entry| {
+            visited.push((*entry.key(), entry.value().clone()));
+        });
+
+        assert_eq!(
+            visited,
+            vec![
+                (10, "ten".to_string()),
+                (20, "twenty".to_string()),
+                (30, "thirty".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn test_iter_mut_with() {
+        let map = setup_test_map();
+
+        map.iter_mut_with(|mut entry| {
+            let key = *entry.key();
+            let val_mut = entry.value_mut().unwrap();
+            *val_mut = format!("{}_{}", val_mut, key);
+        });
+
+        let mut visited = Vec::new();
+        map.iter_with(|entry| {
+            visited.push((*entry.key(), entry.value().clone()));
+        });
+
+        assert_eq!(
+            visited,
+            vec![
+                (10, "ten_10".to_string()),
+                (20, "twenty_20".to_string()),
+                (30, "thirty_30".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn test_entry_exclusion_conflict_on_new_apis() {
+        let map = setup_test_map();
+
+        {
+            let first_guard = map.first_entry().unwrap().unwrap(); // key 10
+
+            assert!(matches!(map.first_entry_mut(), Err(ElementInUse)));
+            assert!(matches!(map.get_mut(&10), Err(ElementInUse)));
+
+            drop(first_guard);
+        }
+
+        {
+            let first_mut_guard = map.first_entry_mut().unwrap().unwrap(); // key 10
+
+            assert!(matches!(map.first_entry(), Err(ElementInMutUse)));
+            assert!(matches!(map.get(&10), Err(ElementInMutUse)));
+            assert!(matches!(map.prev_entry(&20), Err(ElementInMutUse)));
+
+            drop(first_mut_guard);
+        }
     }
 }
